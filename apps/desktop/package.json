@@ -4,12 +4,16 @@
   "version": "0.2.3",
   "type": "module",
   "scripts": {
-    "postinstall": "npm install --prefix frontend",
-    "dev": "tauri dev",
-    "build": "tauri build",
-    "build:exe": "tauri build --target x86_64-pc-windows-msvc --no-bundle",
-    "frontend:dev": "cd frontend && npm run dev",
-    "frontend:build": "cd frontend && npm run build"
+    "postinstall": "powershell -ExecutionPolicy Bypass -File ../../scripts/run_desktop_npm_task.ps1 -Task postinstall",
+    "dev": "powershell -ExecutionPolicy Bypass -File ../../scripts/run_desktop_npm_task.ps1 -Task dev:fast",
+    "dev:frontend": "powershell -ExecutionPolicy Bypass -File ../../scripts/run_desktop_npm_task.ps1 -Task frontend:dev",
+    "dev:tauri": "powershell -ExecutionPolicy Bypass -File ../../scripts/run_desktop_npm_task.ps1 -Task dev",
+    "build": "powershell -ExecutionPolicy Bypass -File ../../scripts/run_desktop_npm_task.ps1 -Task build",
+    "build:exe": "powershell -ExecutionPolicy Bypass -File ../../scripts/run_desktop_npm_task.ps1 -Task build:exe",
+    "frontend:dev": "powershell -ExecutionPolicy Bypass -File ../../scripts/run_desktop_npm_task.ps1 -Task frontend:dev",
+    "frontend:build": "powershell -ExecutionPolicy Bypass -File ../../scripts/run_desktop_npm_task.ps1 -Task frontend:build",
+    "scan:timing:mft": "powershell -ExecutionPolicy Bypass -File ../../scripts/run_desktop_npm_task.ps1 -Task scan:timing:mft",
+    "scan:timing:mft:normal": "powershell -ExecutionPolicy Bypass -File ../../scripts/run_desktop_npm_task.ps1 -Task scan:timing:mft:normal"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

@@ -30,7 +30,19 @@ const THEME_STORAGE_FILE = 'theme.txt'
 
 function App() {
   const { t, i18n } = useTranslation()
-  const win = getCurrentWindow()
+  const isTauriRuntime = useMemo(() => {
+    if (typeof window === 'undefined') return false
+    const internals = (window as Window & { __TAURI_INTERNALS__?: { metadata?: unknown } }).__TAURI_INTERNALS__
+    return Boolean(internals?.metadata)
+  }, [])
+  const win = useMemo(() => {
+    if (!isTauriRuntime) return null
+    try {
+      return getCurrentWindow()
+    } catch {
+      return null
+    }
+  }, [isTauriRuntime])
   const [showSettings, setShowSettings] = useState(false)
   const [showSnapshots, setShowSnapshots] = useState(false)
   const [loadedSnapshot, setLoadedSnapshot] = useState<Snapshot | null>(null)
@@ -59,6 +71,16 @@ function App() {
   const setOnFileDeleted = useCallback((callback: ((path: string) => void) | null) => {
     onFileDeletedRef.current = callback
   }, [])
+
+  const openExternal = useCallback((url: string) => {
+    if (isTauriRuntime) {
+      void open(url).catch(() => {
+        window.open(url, '_blank', 'noopener,noreferrer')
+      })
+      return
+    }
+    window.open(url, '_blank', 'noopener,noreferrer')
+  }, [isTauriRuntime])
 
   // 添加迁移任务（供子组件调用）
   const addMigrateTask = useCallback((
@@ -112,6 +134,7 @@ function App() {
 
   // 监听上传进度事件
   useEffect(() => {
+    if (!isTauriRuntime) return
     const unlisten = listen<UploadProgressEvent>('upload-progress', (event) => {
       const { task_id, progress, uploaded_bytes } = event.payload
       const now = Date.now()
@@ -146,7 +169,7 @@ function App() {
     return () => {
       unlisten.then(fn => fn())
     }
-  }, [])
+  }, [isTauriRuntime])
 
   // 处理队列中的任务
   useEffect(() => {
@@ -356,6 +379,7 @@ function App() {
   const isDraggingRef = useRef<boolean>(false)
 
   const handleTitleBarMouseDown = (e: React.MouseEvent) => {
+    if (!win) return
     const now = Date.now()
     const timeSinceLastClick = now - lastClickTimeRef.current
     
@@ -378,7 +402,7 @@ function App() {
     // 延迟启动拖拽，给双击事件留出时间
     clickTimeoutRef.current = window.setTimeout(() => {
       if (!isDraggingRef.current) {
-        win.startDragging()
+        void win.startDragging()
         isDraggingRef.current = true
       }
     }, 200)
@@ -386,6 +410,7 @@ function App() {
 
   // 双击切换最大化
   const handleTitleBarDoubleClick = async (e: React.MouseEvent) => {
+    if (!win) return
     // 阻止事件冒泡和默认行为
     e.preventDefault()
     e.stopPropagation()
@@ -418,7 +443,7 @@ function App() {
       {/* 菜单栏固定顶部，向下滚动时始终可见 */}
       <header className={`sticky top-0 z-50 shrink-0 h-10 flex items-center border-b select-none ${themeMode === 'dark' ? 'border-gray-700 bg-gray-900' : 'border-border bg-white'} ${platform === 'macos' ? 'pl-16' : ''}`}>
         {/* macOS 窗口控制按钮（左上角） */}
-        {platform === 'macos' && (
+        {platform === 'macos' && win && (
           <Box
             sx={{
               position: 'absolute',
@@ -434,7 +459,7 @@ function App() {
             {/* 关闭按钮（红色） */}
             <Box
               component="button"
-              onClick={() => win.close()}
+              onClick={() => { void win.close() }}
               sx={{
                 width: 12,
                 height: 12,
@@ -457,7 +482,7 @@ function App() {
             {/* 最小化按钮（黄色） */}
             <Box
               component="button"
-              onClick={() => win.minimize()}
+              onClick={() => { void win.minimize() }}
               sx={{
                 width: 12,
                 height: 12,
@@ -480,7 +505,7 @@ function App() {
             {/* 全屏按钮（绿色） */}
             <Box
               component="button"
-              onClick={() => win.toggleMaximize()}
+              onClick={() => { void win.toggleMaximize() }}
               sx={{
                 width: 12,
                 height: 12,
@@ -592,7 +617,7 @@ function App() {
           <Tooltip title={t('tooltip.githubRepo')} arrow>
             <IconButton
               size="small"
-              onClick={() => open('https://github.com/LSTM-Kirigaya/DiskRookie')}
+              onClick={() => openExternal('https://github.com/LSTM-Kirigaya/DiskRookie')}
               sx={{
                 width: '24px',
                 height: '24px',
@@ -609,7 +634,7 @@ function App() {
           <Tooltip title={t('tooltip.email')} arrow>
             <IconButton
               size="small"
-              onClick={() => open('mailto:zhelonghuang@qq.com')}
+              onClick={() => openExternal('mailto:zhelonghuang@qq.com')}
               sx={{
                 width: '24px',
                 height: '24px',
@@ -626,7 +651,7 @@ function App() {
           <Tooltip title={t('tooltip.homepage')} arrow>
             <IconButton
               size="small"
-              onClick={() => open('https://kirigaya.cn/about')}
+              onClick={() => openExternal('https://kirigaya.cn/about')}
               sx={{
                 width: '24px',
                 height: '24px',
@@ -696,11 +721,11 @@ function App() {
         </div>
 
         {/* Windows/Linux 窗口控制按钮（右上角） */}
-        {platform !== 'macos' && (
+        {platform !== 'macos' && win && (
           <div className={`flex items-center border-l ${themeMode === 'dark' ? 'border-gray-700' : 'border-border'}`}>
             <IconButton
               size="small"
-              onClick={() => win.minimize()}
+              onClick={() => { void win.minimize() }}
               title={t('titleBar.minimize')}
               sx={{
                 width: '40px',
@@ -716,7 +741,7 @@ function App() {
             </IconButton>
             <IconButton
               size="small"
-              onClick={() => win.toggleMaximize()}
+              onClick={() => { void win.toggleMaximize() }}
               title={t('titleBar.maximize')}
               sx={{
                 width: '40px',
@@ -732,7 +757,7 @@ function App() {
             </IconButton>
             <IconButton
               size="small"
-              onClick={() => win.close()}
+              onClick={() => { void win.close() }}
               title={t('titleBar.close')}
               sx={{
                 width: '40px',

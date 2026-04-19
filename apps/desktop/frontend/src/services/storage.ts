@@ -1,68 +1,144 @@
-// 本地文件系统存储服务 - 使用 .disk-rookie 目录
 import { invoke } from '@tauri-apps/api/core'
 
+const WEB_STORAGE_PREFIX = 'disk-rookie:'
+
+function normalizeStoragePath(filename: string): string {
+  return filename.trim().replace(/\\/g, '/').replace(/^\/+/, '')
+}
+
+function toWebStorageKey(filename: string): string {
+  return `${WEB_STORAGE_PREFIX}${normalizeStoragePath(filename)}`
+}
+
+function isTauriStorageAvailable(): boolean {
+  if (typeof window === 'undefined') return false
+  const internals = (window as Window & { __TAURI_INTERNALS__?: { invoke?: unknown; metadata?: unknown } }).__TAURI_INTERNALS__
+  return typeof internals?.invoke === 'function' && Boolean(internals?.metadata)
+}
+
 /**
- * 读取存储文件
+ * Read a storage file.
  */
 export async function readStorageFile(filename: string): Promise<string> {
+  const safeName = normalizeStoragePath(filename)
+  if (isTauriStorageAvailable()) {
+    try {
+      return await invoke<string>('read_storage_file', { filename: safeName })
+    } catch (error) {
+      console.error(`Read storage file failed ${safeName}:`, error)
+      return ''
+    }
+  }
+
   try {
-    return await invoke<string>('read_storage_file', { filename })
+    return localStorage.getItem(toWebStorageKey(safeName)) ?? ''
   } catch (error) {
-    console.error(`读取文件失败 ${filename}:`, error)
+    console.error(`Read web storage failed ${safeName}:`, error)
     return ''
   }
 }
 
 /**
- * 写入存储文件
+ * Write a storage file.
  */
 export async function writeStorageFile(filename: string, content: string): Promise<void> {
+  const safeName = normalizeStoragePath(filename)
+  if (isTauriStorageAvailable()) {
+    try {
+      await invoke('write_storage_file', { filename: safeName, content })
+      return
+    } catch (error) {
+      console.error(`Write storage file failed ${safeName}:`, error)
+      throw error
+    }
+  }
+
   try {
-    await invoke('write_storage_file', { filename, content })
+    localStorage.setItem(toWebStorageKey(safeName), content)
   } catch (error) {
-    console.error(`写入文件失败 ${filename}:`, error)
+    console.error(`Write web storage failed ${safeName}:`, error)
     throw error
   }
 }
 
 /**
- * 删除存储文件
+ * Delete a storage file.
  */
 export async function deleteStorageFile(filename: string): Promise<void> {
+  const safeName = normalizeStoragePath(filename)
+  if (isTauriStorageAvailable()) {
+    try {
+      await invoke('delete_storage_file', { filename: safeName })
+      return
+    } catch (error) {
+      console.error(`Delete storage file failed ${safeName}:`, error)
+      throw error
+    }
+  }
+
   try {
-    await invoke('delete_storage_file', { filename })
+    localStorage.removeItem(toWebStorageKey(safeName))
   } catch (error) {
-    console.error(`删除文件失败 ${filename}:`, error)
+    console.error(`Delete web storage failed ${safeName}:`, error)
     throw error
   }
 }
 
 /**
- * 列出存储文件
+ * List files in storage root or a subdir (non-recursive).
  */
 export async function listStorageFiles(subdir?: string): Promise<string[]> {
+  const safeSubdir = subdir ? normalizeStoragePath(subdir).replace(/\/+$/, '') : undefined
+  if (isTauriStorageAvailable()) {
+    try {
+      return await invoke<string[]>('list_storage_files', { subdir: safeSubdir })
+    } catch (error) {
+      console.error('List storage files failed:', error)
+      return []
+    }
+  }
+
   try {
-    return await invoke<string[]>('list_storage_files', { subdir })
+    const result = new Set<string>()
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i)
+      if (!key || !key.startsWith(WEB_STORAGE_PREFIX)) continue
+      const relative = key.slice(WEB_STORAGE_PREFIX.length)
+      if (!relative) continue
+      const slash = relative.lastIndexOf('/')
+      const parent = slash >= 0 ? relative.slice(0, slash) : ''
+      const basename = slash >= 0 ? relative.slice(slash + 1) : relative
+      if (!basename) continue
+      if (safeSubdir) {
+        if (parent === safeSubdir) result.add(basename)
+      } else if (!parent) {
+        result.add(basename)
+      }
+    }
+    return Array.from(result).sort()
   } catch (error) {
-    console.error('列出文件失败:', error)
+    console.error('List web storage files failed:', error)
     return []
   }
 }
 
 /**
- * 获取存储根目录路径
+ * Get storage root path.
  */
 export async function getStoragePath(): Promise<string> {
-  try {
-    return await invoke<string>('get_storage_path')
-  } catch (error) {
-    console.error('获取存储路径失败:', error)
-    return ''
+  if (isTauriStorageAvailable()) {
+    try {
+      return await invoke<string>('get_storage_path')
+    } catch (error) {
+      console.error('Get storage path failed:', error)
+      return ''
+    }
   }
+  return 'browser://localStorage/.disk-rookie'
 }
 
 /**
- * 读取 JSON 文件
+ * Read a JSON file.
  */
 export async function readJSON<T>(filename: string, defaultValue: T): Promise<T> {
   try {
@@ -70,15 +146,16 @@ export async function readJSON<T>(filename: string, defaultValue: T): Promise<T>
     if (!content) return defaultValue
     return JSON.parse(content) as T
   } catch (error) {
-    console.error(`读取 JSON 失败 ${filename}:`, error)
+    console.error(`Read JSON failed ${filename}:`, error)
     return defaultValue
   }
 }
 
 /**
- * 写入 JSON 文件
+ * Write a JSON file.
  */
 export async function writeJSON(filename: string, data: unknown): Promise<void> {
   const content = JSON.stringify(data, null, 2)
   await writeStorageFile(filename, content)
 }
+

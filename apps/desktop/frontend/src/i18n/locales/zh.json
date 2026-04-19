@@ -60,6 +60,7 @@
     "selectFolder": "选择文件夹",
     "startScan": "开始扫描",
     "scanning": "分析中...",
+    "scanComplete": "扫描完成",
     "saveSnapshot": "保存快照",
     "analyzeDiskUsage": "分析磁盘占用",
     "shallowDirs": "快速扫描模式",
@@ -79,6 +80,7 @@
     "scanHasError": "此磁盘的扫描有错误（已改用普通扫描继续）"
   },
   "aiAnalysis": {
+    "start": "开始 AI 分析",
     "preparing": "准备 AI 分析...",
     "calling": "正在调用 AI 分析...",
     "parsing": "解析 AI 建议...",
@@ -110,6 +112,7 @@
     "items": "项",
     "setMigrationTarget": "设置迁移目标",
     "migrateTo": "迁移至:"
+    ,"scanCompleteHint": "扫描已完成，点击按钮后再执行 AI 分析。"
   },
   "snapshot": {
     "management": "快照管理",
@@ -133,7 +136,7 @@
     "saveSnapshot": "保存快照",
     "snapshotName": "快照名称",
     "inputSnapshotName": "为这个快照起个名字...",
-    "saveHint2": "快照将保存扫描结果，不包含 AI 分析内容",
+    "saveHint2": "快照将保存扫描结果、摘要、AI 提示词、AI 原文和结构化结果",
     "justNow": "刚刚",
     "minutesAgo": "{{count}} 分钟前",
     "hoursAgo": "{{count}} 小时前",
@@ -268,6 +271,10 @@
     "testConnectionFailed": "大模型连接失败",
     "useMftScan": "使用 MFT 加速扫描磁盘根路径",
     "useMftScanHint": "勾选后，当扫描 C 盘、D 盘等磁盘根路径时使用 NTFS MFT 技术加速（仅 Windows 有效）",
+    "snapshotSaveDir": "快照保存目录",
+    "snapshotSaveDirHint": "相对于应用存储根目录（默认：snapshots）",
+    "autoSaveAfterAi": "AI 分析后自动保存快照",
+    "autoSaveAfterAiHint": "开启后，每次 AI 分析完成自动保存扫描结果、摘要与 AI 结果",
     "saveAsPreset": "保存为 API 地址选项",
     "saveAsPresetHint": "将当前填写的 API 地址保存为一个选项，下次可直接从下拉列表中选择。建议先测试连接成功后再保存。",
     "presetNamePlaceholder": "输入预设名称，如：我的 DeepSeek",

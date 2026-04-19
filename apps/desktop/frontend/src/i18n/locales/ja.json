@@ -60,6 +60,7 @@
     "selectFolder": "フォルダを選択",
     "startScan": "スキャン開始",
     "scanning": "分析中...",
+    "scanComplete": "スキャン完了",
     "saveSnapshot": "スナップショットを保存",
     "analyzeDiskUsage": "ディスク使用量を分析",
     "shallowDirs": "クイックスキャンモード",
@@ -79,6 +80,7 @@
     "scanHasError": "このディスクのスキャンでエラーが発生しました（通常スキャンで続行）"
   },
   "aiAnalysis": {
+    "start": "AI分析を開始",
     "preparing": "AI分析を準備中...",
     "calling": "AI分析を呼び出し中...",
     "parsing": "AI提案を解析中...",
@@ -110,6 +112,7 @@
     "items": "件",
     "setMigrationTarget": "移行先を設定",
     "migrateTo": "移行先:"
+    ,"scanCompleteHint": "スキャンは完了しました。ボタンを押すと AI 分析を開始します。"
   },
   "snapshot": {
     "management": "スナップショット管理",
@@ -133,7 +136,7 @@
     "saveSnapshot": "スナップショットを保存",
     "snapshotName": "スナップショット名",
     "inputSnapshotName": "スナップショットに名前を付けてください...",
-    "saveHint2": "スナップショットはスキャン結果を保存、AI分析は含みません",
+    "saveHint2": "スナップショットはスキャン結果、要約、AIプロンプト、AI生文、構造化結果を保存します",
     "justNow": "たった今",
     "minutesAgo": "{{count}}分前",
     "hoursAgo": "{{count}}時間前",
@@ -269,6 +272,10 @@
     "testConnectionFailed": "大規模言語モデル接続失敗",
     "useMftScan": "ディスクルートでMFTでスキャン加速",
     "useMftScanHint": "有効時、WindowsでC:\\、D:\\などのボリュームルートをNTFS MFTでスキャン",
+    "snapshotSaveDir": "スナップショット保存先",
+    "snapshotSaveDirHint": "アプリ保存ルートからの相対パス（既定: snapshots）",
+    "autoSaveAfterAi": "AI分析後に自動保存",
+    "autoSaveAfterAiHint": "有効時、AI分析完了ごとにスキャン結果・要約・AI結果を自動保存します",
     "saveAsPreset": "API URLをプリセットに保存",
     "saveAsPresetHint": "現在のAPI URLをプリセットとして保存し、次回からドロップダウンで選択できます。接続テスト後に保存することをおすすめします。",
     "presetNamePlaceholder": "プリセット名を入力（例：My DeepSeek）",

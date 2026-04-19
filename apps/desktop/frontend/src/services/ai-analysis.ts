@@ -25,6 +25,8 @@ export interface CleanupSuggestion {
 export interface AnalysisResult {
   suggestions: CleanupSuggestion[]
   summary: string
+  promptText?: string
+  rawText?: string
   tokenUsage?: {
     prompt_tokens: number
     completion_tokens: number
@@ -242,6 +244,7 @@ Please carefully analyze the data and provide reasonable, safe suggestions. All 
         : `以下のディスク使用量データを分析し、${languageName}でクリーンアップ提案を提供してください：\n\n${diskSummary}`
     }
   ]
+  const promptText = messages.map((m) => `[${m.role}]\n${m.content}`).join('\n\n')
 
   onProgress?.(i18n.t('aiAnalysis.calling'))
 
@@ -274,12 +277,17 @@ Please carefully analyze the data and provide reasonable, safe suggestions. All 
       }),
     })
 
+    const rawText = await response.text()
     if (!response.ok) {
-      const errorText = await response.text()
-      throw new Error(`AI 请求失败: ${response.status} - ${errorText}`)
+      throw new Error(`AI 请求失败: ${response.status} - ${rawText}`)
     }
 
-    const data = await response.json() as ChatCompletionResponse
+    let data: ChatCompletionResponse
+    try {
+      data = JSON.parse(rawText) as ChatCompletionResponse
+    } catch {
+      throw new Error('AI 响应不是有效 JSON')
+    }
     const choice = data.choices[0]
     
     if (!choice) {
@@ -300,6 +308,8 @@ Please carefully analyze the data and provide reasonable, safe suggestions. All 
           return {
             suggestions,
             summary: i18n.t('aiAnalysis.foundSuggestions', { count: suggestions.length }),
+            promptText,
+            rawText,
             tokenUsage: data.usage
           }
         } catch (parseError) {
@@ -313,6 +323,8 @@ Please carefully analyze the data and provide reasonable, safe suggestions. All 
     return {
       suggestions: [],
       summary: content || 'AI 未提供具体建议',
+      promptText,
+      rawText,
       tokenUsage: data.usage
     }
   } catch (error) {

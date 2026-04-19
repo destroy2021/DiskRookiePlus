@@ -138,7 +138,7 @@ fn mft_record0_diagnostic() {
         ntfs_reader::aligned_reader::open_volume(volume.path.as_path()).expect("open again");
     let record = Mft::get_record_fs(
         &mut reader2,
-        volume.file_record_size as usize,
+        volume.file_record_size,
         volume.mft_position,
     );
     match &record {
@@ -182,7 +182,7 @@ fn mft_record0_same_flow_as_app() {
             };
             match Mft::get_record_fs(
                 &mut reader,
-                volume.file_record_size as usize,
+                volume.file_record_size,
                 volume.mft_position,
             ) {
                 Ok(record) => {

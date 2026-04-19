@@ -19,11 +19,25 @@ import { loadSafeListPaths, isPathInSafeList, addToSafeList } from '../services/
 import { CloudStorageSelector } from './CloudStorageSelector'
 import type { Task } from '../services/taskQueue'
 
-/** 按大小排序的前 N 大文件条目（MFT 扫描时由后端填充） */
 interface TopFileEntry {
     path: string
     size: number
     modified?: number | null
+}
+
+interface SummaryEntry {
+    path: string
+    name: string
+    size: number
+    file_count?: number | null
+    dir_count?: number | null
+    is_dir: boolean
+}
+
+interface ExtensionStat {
+    ext: string
+    size: number
+    count: number
 }
 
 interface ScanResult {
@@ -31,27 +45,39 @@ interface ScanResult {
     scan_time_ms: number
     file_count: number
     total_size: number
-    /** 当 MFT 扫描失败并回退到普通扫描时，后端会设置此字段，前端用于标注「此磁盘的扫描有错误」 */
     scan_warning?: string | null
-    /** 卷总容量（字节），由操作系统 API 获取 */
     volume_total_bytes?: number | null
-    /** 卷剩余可用空间（字节） */
     volume_free_bytes?: number | null
-    /** 按大小排序的前 N 大文件，供摘要与 AI 分析用，避免遍历整棵树 */
     top_files?: TopFileEntry[] | null
+    top_directories?: SummaryEntry[] | null
+    root_children?: SummaryEntry[] | null
+    extension_stats?: ExtensionStat[] | null
 }
 
 const PROMPT_INSTRUCTION_FILE = 'prompt-instruction.txt'
+const FILE_LIST_SUMMARY_CACHE_MAX = 20
+const fileListSummaryCache = new Map<string, string>()
 
-/** Windows 下将 "C:" 规范为 "C:\"，便于后端识别为卷根并走 MFT 全量扫描 */
+function buildSummaryCacheKey(result: ScanResult, fileCount: number): string {
+    return [
+        result.scan_time_ms,
+        result.file_count,
+        result.total_size,
+        result.root.path || result.root.name || '',
+        result.top_files?.length ?? 0,
+        result.top_directories?.length ?? 0,
+        result.root_children?.length ?? 0,
+        result.extension_stats?.length ?? 0,
+        fileCount,
+    ].join('|')
+}
+
 function normalizeScanPath(p: string): string {
   const trimmed = p.trim()
   if (!trimmed) return trimmed
 
-  // Unix/macOS 绝对路径保持原样，避免 "/Users/..." 被错误转成 "\Users\..."
   if (trimmed.startsWith('/')) return trimmed
 
-  // 仅对 Windows 风格路径做规范化
   if (/^[A-Za-z]:/.test(trimmed) || trimmed.startsWith('\\\\')) {
     const normalized = trimmed.replace(/\//g, '\\')
     if (/^[A-Za-z]:$/.test(normalized)) return normalized + '\\'
@@ -61,7 +87,19 @@ function normalizeScanPath(p: string): string {
   return trimmed
 }
 
-const DEFAULT_PROMPT_INSTRUCTION = '请根据以上占用，简要指出可安全清理或迁移的大项，并给出操作建议。'
+function buildDefaultSnapshotName(path: string): string {
+  const pathParts = path.split(/[/\\]/).filter(Boolean)
+  const source = pathParts[pathParts.length - 1] || 'snapshot'
+  const ts = new Date().toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+  return `${source} - ${ts}`
+}
+
+const DEFAULT_PROMPT_INSTRUCTION = '请基于以上磁盘摘要，识别可安全清理或迁移的候选项，并给出简明理由。'
 const SKIP_SAFELIST_CONFIRM_KEY = 'skip-add-to-safelist-confirm'
 
 async function loadPromptInstruction(): Promise<string> {
@@ -79,18 +117,16 @@ async function savePromptInstruction(instruction: string): Promise<void> {
     }
 }
 
-/** AI 提示面板 */
 function AIPromptPanel({ result }: { result: ScanResult }) {
     const { t } = useTranslation()
     const [fileListSummary, setFileListSummary] = useState('')
     const [instruction, setInstruction] = useState(DEFAULT_PROMPT_INSTRUCTION)
     const [copied, setCopied] = useState(false)
-    // 文件数量滑块值，与设置中的「Prompt 文件数量」完全共用同一配置，范围 20–2000（与设置对话框一致）
     const PROMPT_FILE_COUNT_MIN = 20
     const PROMPT_FILE_COUNT_MAX = 2000
     const [fileCount, setFileCount] = useState(100)
+    const summaryDepsKey = `${result.scan_time_ms}|${result.file_count}|${result.total_size}|${result.root.path || result.root.name}|${result.top_files?.length ?? 0}|${result.top_directories?.length ?? 0}|${result.root_children?.length ?? 0}|${result.extension_stats?.length ?? 0}|${fileCount}`
 
-    // 加载保存的表格行数（与设置中的「Prompt 文件数量」共用 app-settings.json，范围 20–2000）
     useEffect(() => {
         let cancelled = false
         loadAppSettings().then(s => {
@@ -104,17 +140,14 @@ function AIPromptPanel({ result }: { result: ScanResult }) {
         }
     }, [])
 
-    // 表格行数变化时保存到应用设置（与设置对话框完全同步）
     useEffect(() => {
         if (fileCount >= PROMPT_FILE_COUNT_MIN && fileCount <= PROMPT_FILE_COUNT_MAX) {
             loadAppSettings().then(s => void saveAppSettings({ ...s, promptFileCount: fileCount }))
         }
     }, [fileCount])
 
-    // 当 result 或 fileCount 改变时，重新生成摘要
     useEffect(() => {
         let cancelled = false
-        // 使用 fileCount 参数，确保表格行数变化时能正确更新
 
         
         buildFileListSummary(result, fileCount).then(summary => {
@@ -126,8 +159,7 @@ function AIPromptPanel({ result }: { result: ScanResult }) {
         return () => {
             cancelled = true
         }
-        // 明确列出所有依赖项，确保 fileCount 变化时能触发更新
-    }, [result.file_count, result.total_size, result.scan_time_ms, fileCount, result])
+    }, [summaryDepsKey, fileCount, result])
 
     useEffect(() => {
         loadPromptInstruction().then(setInstruction)
@@ -182,7 +214,6 @@ function AIPromptPanel({ result }: { result: ScanResult }) {
                         {copied ? t('common.copied') : t('common.copyAll')}
                     </Button>
                 </div>
-                {/* 文件数量滑块 - 移动到顶部 */}
                 <Box sx={{ px: 2, py: 1.5, bgcolor: 'action.hover', borderRadius: '12px', border: '1px solid', borderColor: 'divider' }} className="dark:!bg-gray-700/30 dark:!border-gray-600">
                     <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
                         <Typography variant="caption" sx={{ color: 'text.secondary' }}>
@@ -298,6 +329,10 @@ function displayPath(raw: string): string {
     return raw.replace(/^\\\\\?\\/, '')
 }
 
+function formatCount(n: number): string {
+    return n.toLocaleString('zh-CN')
+}
+
 function formatModified(ts: number | undefined | null): string {
     if (ts == null) return '-'
     try {
@@ -308,59 +343,213 @@ function formatModified(ts: number | undefined | null): string {
     }
 }
 
+function normalizeExtLabel(ext: string): string {
+    if (!ext || ext === '[no_ext]') return '(无扩展名)'
+    return ext.startsWith('.') ? ext : `.${ext}`
+}
+
+function mdEscape(text: string): string {
+    return text.replace(/\|/g, '\\|')
+}
+
+function mdTable(headers: string[], rows: string[][]): string {
+    const header = `| ${headers.join(' | ')} |\n| ${headers.map(() => '---').join(' | ')} |`
+    if (rows.length === 0) return `${header}\n| (无数据) | - | - |`
+    const body = rows.map((r) => `| ${r.map(mdEscape).join(' | ')} |`).join('\n')
+    return `${header}\n${body}`
+}
+
+type FileCandidate = { path: string; size: number; modified?: number | null }
+
+function collectFallbackSummary(root: TreemapNode): {
+    topDirectories: SummaryEntry[]
+    rootChildren: SummaryEntry[]
+    extensionStats: ExtensionStat[]
+    topFiles: FileCandidate[]
+} {
+    const topDirectories: SummaryEntry[] = []
+    const extAgg = new Map<string, { size: number; count: number }>()
+    const countByPath = new Map<string, { files: number; dirs: number }>()
+    const topFiles: FileCandidate[] = []
+
+    function walk(node: TreemapNode, isRoot: boolean, depth: number): { files: number; dirs: number } {
+        if (depth > 20) return { files: 0, dirs: 0 }
+        if (!node.is_dir) {
+            const extRaw = node.path?.split('.').pop() ?? ''
+            const ext = node.path?.includes('.') ? `.${extRaw.toLowerCase()}` : '[no_ext]'
+            const agg = extAgg.get(ext) ?? { size: 0, count: 0 }
+            agg.size += node.size
+            agg.count += 1
+            extAgg.set(ext, agg)
+            topFiles.push({ path: node.path || node.name, size: node.size, modified: node.modified ?? null })
+            return { files: 1, dirs: 0 }
+        }
+
+        let files = 0
+        let dirs = 0
+        for (const child of node.children ?? []) {
+            const childCount = walk(child, false, depth + 1)
+            files += childCount.files
+            dirs += childCount.dirs
+            if (child.is_dir) dirs += 1
+        }
+        countByPath.set(node.path || node.name, { files, dirs })
+
+        if (!isRoot) {
+            topDirectories.push({
+                path: node.path || node.name,
+                name: node.name,
+                size: node.size,
+                file_count: files,
+                dir_count: dirs,
+                is_dir: true,
+            })
+        }
+        return { files, dirs }
+    }
+
+    walk(root, true, 0)
+
+    const rootChildren = (root.children ?? []).map((child) => {
+        const c = countByPath.get(child.path || child.name) ?? { files: 0, dirs: 0 }
+        return {
+            path: child.path || child.name,
+            name: child.name,
+            size: child.size,
+            file_count: child.is_dir ? c.files : undefined,
+            dir_count: child.is_dir ? c.dirs : undefined,
+            is_dir: child.is_dir,
+        } as SummaryEntry
+    })
+
+    const extensionStats = Array.from(extAgg.entries()).map(([ext, value]) => ({
+        ext,
+        size: value.size,
+        count: value.count,
+    }))
+
+    topDirectories.sort((a, b) => b.size - a.size || a.path.localeCompare(b.path))
+    rootChildren.sort((a, b) => b.size - a.size || a.path.localeCompare(b.path))
+    extensionStats.sort((a, b) => b.size - a.size || b.count - a.count)
+    topFiles.sort((a, b) => b.size - a.size || a.path.localeCompare(b.path))
+
+    return { topDirectories, rootChildren, extensionStats, topFiles }
+}
+
 async function buildFileListSummary(result: ScanResult, fileCount?: number): Promise<string> {
-    // 如果没有指定 fileCount，则从设置中读取
     if (fileCount === undefined) {
         const settings = await loadAppSettings()
         fileCount = settings.promptFileCount
     }
 
-    const count = fileCount
-    let candidates: { path: string; size: number; modified?: number | null }[]
-
-    // 优先使用后端提供的 top_files（MFT 扫描时已按大小排序），先取全部候选，再按安全名单过滤并补足行数
-    if (result.top_files && result.top_files.length > 0) {
-        candidates = result.top_files.map((n) => ({
-            path: n.path,
-            size: n.size,
-            modified: n.modified ?? null,
-        }))
-    } else {
-        const nodes: { path: string; size: number; modified?: number | null }[] = []
-        function collect(n: TreemapNode, depth: number) {
-            if (depth > 20) return
-            if (!n.is_dir) nodes.push({ path: n.path || n.name, size: n.size, modified: n.modified })
-            if (n.children?.length) {
-                [...n.children].sort((a, b) => b.size - a.size).slice(0, 10).forEach((c) => collect(c, depth + 1))
-            }
-        }
-        collect(result.root, 0)
-        candidates = nodes.sort((a, b) => b.size - a.size)
+    const count = Math.max(20, fileCount)
+    const cacheKey = buildSummaryCacheKey(result, count)
+    const cached = fileListSummaryCache.get(cacheKey)
+    if (cached) {
+        return cached
+    }
+    let fallback: ReturnType<typeof collectFallbackSummary> | null = null
+    const getFallback = () => {
+        if (fallback == null) fallback = collectFallbackSummary(result.root)
+        return fallback
     }
 
-    // 排除安全名单中的路径，再取前 count 条，保证表格行数为用户设定且仍按大小从大到小
+    const topDirectories = result.top_directories && result.top_directories.length > 0
+        ? result.top_directories
+        : getFallback().topDirectories
+    const rootChildren = result.root_children && result.root_children.length > 0
+        ? result.root_children
+        : getFallback().rootChildren
+    const extensionStats = result.extension_stats && result.extension_stats.length > 0
+        ? result.extension_stats
+        : getFallback().extensionStats
+    const topFileCandidates: FileCandidate[] = result.top_files && result.top_files.length > 0
+        ? result.top_files.map((n) => ({ path: n.path, size: n.size, modified: n.modified ?? null }))
+        : getFallback().topFiles
+
     const safeList = await loadSafeListPaths()
-    const items = candidates
+    const topFiles = topFileCandidates
         .filter((n) => !isPathInSafeList(n.path, safeList))
         .slice(0, count)
 
-    const header = '| 路径 | 大小 | 最近修改时间 |\n| --- | --- | --- |\n'
-    const rows = items.map((n) => `| ${displayPath(n.path)} | ${formatBytes(n.size)} | ${formatModified(n.modified)} |`).join('\n')
-    return `[磁盘分析结果]\n总大小: ${formatBytes(result.total_size)}，文件数: ${result.file_count}\n\n${header}${rows}`
+    const scanPath = displayPath(result.root.path || result.root.name || '-')
+    const overview = [
+        '[磁盘分析摘要]',
+        `扫描路径: ${scanPath}`,
+        `总大小: ${formatBytes(result.total_size)}`,
+        `文件数: ${formatCount(result.file_count)}`,
+        `卷容量: ${result.volume_total_bytes && result.volume_total_bytes > 0 ? formatBytes(result.volume_total_bytes) : '-'}`,
+        `剩余空间: ${result.volume_free_bytes && result.volume_free_bytes > 0 ? formatBytes(result.volume_free_bytes) : '-'}`,
+    ].join('\n')
+
+    const rootChildrenTable = mdTable(
+        ['路径', '大小', '类型'],
+        rootChildren.slice(0, 10).map((n) => [
+            displayPath(n.path),
+            formatBytes(n.size),
+            n.is_dir ? '目录' : '文件',
+        ])
+    )
+
+    const topDirsTable = mdTable(
+        ['路径', '大小', '文件数'],
+        topDirectories.slice(0, 20).map((n) => [
+            displayPath(n.path),
+            formatBytes(n.size),
+            n.file_count != null ? formatCount(n.file_count) : '-',
+        ])
+    )
+
+    const topFilesTable = mdTable(
+        ['路径', '大小', '修改时间'],
+        topFiles.map((n) => [
+            displayPath(n.path),
+            formatBytes(n.size),
+            formatModified(n.modified),
+        ])
+    )
+
+    const extTable = mdTable(
+        ['扩展名', '总大小', '文件数'],
+        extensionStats.slice(0, 20).map((n) => [
+            normalizeExtLabel(n.ext),
+            formatBytes(n.size),
+            formatCount(n.count),
+        ])
+    )
+
+    const summary = [
+        overview,
+        '## 一级分布 Top 10',
+        rootChildrenTable,
+        '## 最大目录 Top 20',
+        topDirsTable,
+        `## 最大文件 Top ${count}`,
+        topFilesTable,
+        '## 扩展名聚合 Top 20',
+        extTable,
+    ].join('\n\n')
+    fileListSummaryCache.set(cacheKey, summary)
+    if (fileListSummaryCache.size > FILE_LIST_SUMMARY_CACHE_MAX) {
+        const oldestKey = fileListSummaryCache.keys().next().value
+        if (oldestKey) fileListSummaryCache.delete(oldestKey)
+    }
+    return summary
 }
 
 export interface ExpertModeProps {
     onOpenSettings?: () => void
     loadedSnapshot?: Snapshot | null
     onSnapshotLoaded?: () => void
-    settingsSavedTrigger?: number  // 设置保存触发器
+    settingsSavedTrigger?: number
     onAddMigrateTask?: (sourcePath: string, fileSize: number, targetConfigs: CloudStorageConfig[], targetPath: string) => string
-    onFileDeleted?: (callback: ((path: string) => void) | null) => void  // 设置文件删除通知回调
-    tasks?: Task[]  // 任务队列，用于同步状态
+    onFileDeleted?: (callback: ((path: string) => void) | null) => void
+    tasks?: Task[]
 }
 
 export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, settingsSavedTrigger, onAddMigrateTask, onFileDeleted, tasks = [] }: ExpertModeProps) {
     const { t } = useTranslation()
+    const isTauriRuntime = typeof window !== 'undefined' && Boolean((window as Window & { __TAURI_INTERNALS__?: { metadata?: unknown } }).__TAURI_INTERNALS__?.metadata)
     const [path, setPath] = useState('')
     const [status, setStatus] = useState<'idle' | 'scanning' | 'done' | 'error'>('idle')
     const [errorMsg, setErrorMsg] = useState('')
@@ -373,33 +562,31 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
     const [shallowDirs, setShallowDirs] = useState(true)
     const openedSettingsForStandardRef = useRef(false)
 
-    // 标准模式 AI 分析状态
     const [aiAnalyzing, setAiAnalyzing] = useState(false)
     const [aiProgress, setAiProgress] = useState('')
     const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null)
+    const [latestSummary, setLatestSummary] = useState('')
+    const [latestAiPrompt, setLatestAiPrompt] = useState('')
+    const [latestAiRawText, setLatestAiRawText] = useState('')
     const [deletedPaths, setDeletedPaths] = useState<Set<string>>(new Set())
     const [actionFilter, setActionFilter] = useState<'all' | 'delete' | 'move'>('all')
     const [hoveredPieIndex, setHoveredPieIndex] = useState<number | null>(null)
     const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set())
-    // 操作类型覆盖映射：允许用户手动切换删除和迁移
     const [actionOverrides, setActionOverrides] = useState<Map<string, 'delete' | 'move'>>(new Map())
 
-    // 快照保存对话框
     const [showSaveDialog, setShowSaveDialog] = useState(false)
     const [snapshotName, setSnapshotName] = useState('')
 
-    // 加入安全名单确认对话框
     const [safeListDialog, setSafeListDialog] = useState<{ open: boolean; path: string | null; dontRemind: boolean }>({ open: false, path: null, dontRemind: false })
-    // 本页已加入安全名单的路径，从右侧列表中隐藏（不删数据，仅不展示）
     const [addedToSafeListPaths, setAddedToSafeListPaths] = useState<Set<string>>(new Set())
 
-    // 云存储选择相关状态
     const [showCloudSelector, setShowCloudSelector] = useState(false)
     const [availableConfigs, setAvailableConfigs] = useState<CloudStorageConfig[]>([])
     const [selectedMigrationConfigs, setSelectedMigrationConfigs] = useState<CloudStorageConfig[]>([])
     const [migrationTargetNames, setMigrationTargetNames] = useState<string>('')
 
     useEffect(() => {
+        if (!isTauriRuntime) return
         let unlistenProgress: (() => void) | undefined
         let unlistenMftStatus: (() => void) | undefined
         getCurrentWindow().listen<[number, string]>('scan-progress', (ev) => {
@@ -410,7 +597,7 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         getCurrentWindow().listen<[string, boolean]>('scan-mft-status', (ev) => {
             const [path, usedMft] = ev.payload
             if (usedMft) {
-                console.log('[DiskRookie] 本次扫描已成功使用 MFT 技术，路径:', path)
+                console.log('[DiskRookie] 本次扫描已使用 MFT 加速，路径:', path)
             } else {
                 console.log('[DiskRookie] 本次扫描未使用 MFT（普通目录遍历），路径:', path)
             }
@@ -419,49 +606,63 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
             unlistenProgress?.()
             unlistenMftStatus?.()
         }
-    }, [])
+    }, [isTauriRuntime])
+
+    const runAiAnalysis = useCallback(async (scanResult: ScanResult) => {
+        setAiAnalyzing(true)
+        setAiProgress(t('aiAnalysis.preparing'))
+        try {
+            const appSettings = await loadAppSettings()
+            const aiSettings = await loadSettings()
+            if (!(await resolveEffectiveApiKey(aiSettings))?.trim()) {
+                throw new Error('Please configure API key in settings first.')
+            }
+            const summary = await buildFileListSummary(scanResult, appSettings.promptFileCount)
+            setLatestSummary(summary)
+            const aiResult = await analyzeWithAI(summary, (msg) => setAiProgress(msg))
+            setAnalysisResult(aiResult)
+            setLatestAiPrompt(aiResult.promptText ?? '')
+            setLatestAiRawText(aiResult.rawText ?? '')
+            const suggestionCount = aiResult.suggestions.length
+            const notificationBody = suggestionCount > 0
+                ? t('aiAnalysis.foundSuggestions', { count: suggestionCount })
+                : aiResult.summary || t('aiAnalysis.noSuggestions')
+            await showNotification(t('aiAnalysis.complete'), notificationBody)
+            if (appSettings.autoSaveAfterAi === true && path.trim()) {
+                const autoSnapshotName = buildDefaultSnapshotName(path)
+                await saveSnapshot({
+                    name: autoSnapshotName,
+                    path,
+                    scanResult,
+                    summary,
+                    ai_prompt: aiResult.promptText ?? '',
+                    ai_raw_text: aiResult.rawText ?? '',
+                    ai_structured_result: aiResult,
+                })
+                await showNotification(t('snapshot.saveSuccess'), t('snapshot.savedSnapshot', { name: autoSnapshotName }))
+            }
+        } catch (aiError) {
+            setErrorMsg(`${t('aiAnalysis.failed')}: ${aiError}`)
+            await showNotification(t('aiAnalysis.failed'), String(aiError))
+        } finally {
+            setAiAnalyzing(false)
+            setAiProgress('')
+        }
+    }, [path, t])
 
     const runScan = useCallback(async (targetPath: string) => {
         if (!targetPath) return
         const pathToScan = normalizeScanPath(targetPath)
-        setStatus('scanning'); setErrorMsg(''); setResult(null); setProgressFiles(0); setProgressMessage(''); setAnalysisResult(null); setActionFilter('all'); setActionOverrides(new Map());
+        setStatus('scanning'); setErrorMsg(''); setResult(null); setProgressFiles(0); setProgressMessage(''); setAnalysisResult(null); setLatestSummary(''); setLatestAiPrompt(''); setLatestAiRawText(''); setActionFilter('all'); setActionOverrides(new Map());
         try {
             const appSettings = await loadAppSettings()
             const useMft = appSettings.useMftScan !== false
             const res = await invoke<ScanResult>('scan_path_command', { path: pathToScan, shallowDirs, useMft })
             setResult(res); setStatus('done');
-
-            // 标准模式：扫描完成后自动调用 AI 分析（与设置里「测试连接」相同：resolveEffectiveApiKey + Kimi Coding 时带 OAuth / User-Agent）
-            if (isAdmin === false) {
-                setAiAnalyzing(true)
-                setAiProgress(t('aiAnalysis.preparing'))
-                try {
-                    const aiSettings = await loadSettings()
-                    if (!(await resolveEffectiveApiKey(aiSettings))?.trim()) {
-                        throw new Error('请先在设置中配置 API Key，或完成 Kimi Code 登录')
-                    }
-                    const summary = await buildFileListSummary(res, appSettings.promptFileCount)
-                    const aiResult = await analyzeWithAI(summary, (msg) => setAiProgress(msg))
-                    setAnalysisResult(aiResult)
-                    // AI分析完成后显示系统通知（Windows右下角/macOS右上角）
-                    const suggestionCount = aiResult.suggestions.length
-                    const notificationBody = suggestionCount > 0 
-                        ? t('aiAnalysis.foundSuggestions', { count: suggestionCount })
-                        : aiResult.summary || t('aiAnalysis.noSuggestions')
-                    await showNotification(t('aiAnalysis.complete'), notificationBody)
-                } catch (aiError) {
-                    setErrorMsg(`${t('aiAnalysis.failed')}: ${aiError}`)
-                    // 分析失败时也显示系统通知
-                    await showNotification(t('aiAnalysis.failed'), String(aiError))
-                } finally {
-                    setAiAnalyzing(false)
-                    setAiProgress('')
-                }
-            }
         } catch (e) {
             setStatus('error'); setErrorMsg(String(e));
         }
-    }, [shallowDirs, isAdmin])
+    }, [shallowDirs])
 
     const handleBrowseFolder = useCallback(async () => {
         const selected = await open({ directory: true, multiple: false });
@@ -471,10 +672,14 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         }
     }, [runScan])
 
+    const switchViewMode = useCallback((next: 'disk' | 'ai-prompt') => {
+        if (viewMode === next) return
+        setViewMode(next)
+    }, [viewMode])
+
     const handleDelete = useCallback(async (itemPath: string) => {
         await deleteItem(itemPath)
         setDeletedPaths(prev => new Set([...prev, itemPath]))
-        // 从选中项中移除已删除的项
         setSelectedItems(prev => {
             const next = new Set(prev)
             next.delete(itemPath)
@@ -482,7 +687,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         })
     }, [])
 
-    // 处理选中状态变化
     const handleSelectChange = useCallback((path: string, selected: boolean) => {
         setSelectedItems(prev => {
             const next = new Set(prev)
@@ -495,7 +699,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         })
     }, [])
 
-    // 切换操作类型（删除 <-> 迁移）
     const handleToggleAction = useCallback((path: string, currentAction: 'delete' | 'move') => {
         setActionOverrides(prev => {
             const next = new Map(prev)
@@ -505,12 +708,10 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         })
     }, [])
 
-    // 获取实际的操作类型（考虑覆盖）
     const getActualAction = useCallback((path: string, originalAction: 'delete' | 'move'): 'delete' | 'move' => {
         return actionOverrides.get(path) || originalAction
     }, [actionOverrides])
 
-    // 点击「加入安全名单」：若用户勾选过「不再提醒」则直接加入并从列表移除，否则弹窗确认
     const handleAddToSafeListClick = useCallback(async (itemPath: string) => {
         const skipConfirm = await readStorageFile(SKIP_SAFELIST_CONFIRM_KEY)
         if (skipConfirm === 'true') {
@@ -521,7 +722,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         setSafeListDialog({ open: true, path: itemPath, dontRemind: false })
     }, [])
 
-    // 安全名单确认对话框：确认后加入并可选「不再提醒」，并从右侧列表中移除该条
     const handleSafeListConfirm = useCallback(async () => {
         const { path: itemPath, dontRemind } = safeListDialog
         if (!itemPath) {
@@ -536,7 +736,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         setSafeListDialog({ open: false, path: null, dontRemind: false })
     }, [safeListDialog])
 
-    // 解析文件大小字符串为字节数
     const parseSizeToBytes = (sizeStr: string): number => {
         const match = sizeStr.match(/^([\d.]+)\s*(B|KB|MB|GB|TB)$/i)
         if (!match) return 0
@@ -555,7 +754,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         return Math.floor(value * (units[unit] || 1))
     }
 
-    // 一键全选/取消全选
     const handleSelectAll = useCallback(() => {
         if (!analysisResult) return
         
@@ -567,7 +765,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
             })
             .map(s => s.path)
         
-        // 检查是否已全选，如果是则取消全选
         const allSelected = allPaths.every(p => selectedItems.has(p))
         if (allSelected) {
             setSelectedItems(new Set())
@@ -577,45 +774,37 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
     }, [analysisResult, deletedPaths, addedToSafeListPaths, actionFilter, selectedItems, getActualAction])
 
     const handleMove = useCallback(async (itemPath: string, configs?: CloudStorageConfig[], targetPath?: string, fileSize?: number) => {
-        // 使用传入的 configs 或全局设置的 selectedMigrationConfigs
         const targetConfigs = configs || selectedMigrationConfigs
         const cloudPath = targetPath || '/'
 
         if (!targetConfigs || targetConfigs.length === 0) {
-            throw new Error('未选择云存储目标')
+            throw new Error('No cloud storage target selected')
         }
 
-        // 如果有任务队列回调，则添加到队列
         if (onAddMigrateTask) {
-            // 获取文件大小（如果没有传入）
             const size = fileSize || 0
             onAddMigrateTask(itemPath, size, targetConfigs, cloudPath)
             return
         }
 
-        // 否则直接执行（兼容旧逻辑）
         console.log('迁移文件到云存储:', { itemPath, targetConfigs, cloudPath })
 
-        // 动态导入 refreshGoogleToken
         const { refreshGoogleToken } = await import('../services/settings')
 
-        // 构建上传配置，并检查/刷新 token
         const uploadConfigs = []
         for (const config of targetConfigs) {
             if (!config.accessToken) {
-                throw new Error(`${config.name} 未登录，请先在设置中配置云存储`)
+                throw new Error(`${config.name} is not logged in. Please configure cloud storage in settings.`)
             }
 
             let accessToken = config.accessToken
 
-            // 检查 token 是否即将过期（5分钟内）
             if (config.tokenExpiry) {
-                const expiryBuffer = 5 * 60 * 1000 // 5 分钟
+                const expiryBuffer = 5 * 60 * 1000
                 if (config.tokenExpiry - Date.now() < expiryBuffer) {
                     if (!config.refreshToken) {
-                        throw new Error(`${config.name} 登录已过期，请重新登录`)
+                        throw new Error(`${config.name} login expired. Please sign in again.`)
                     }
-                    // 刷新 token
                     console.log(`刷新 ${config.name} 的 token...`)
                     try {
                         const newTokens = await refreshGoogleToken(config.refreshToken)
@@ -634,7 +823,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
             })
         }
 
-        // 调用后端上传 API
         interface UploadResult {
             success: boolean
             provider: string
@@ -647,16 +835,14 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
             configs: uploadConfigs,
         })
 
-        // 检查上传结果
         const failed = results.filter(r => !r.success)
         if (failed.length > 0) {
             throw new Error(failed.map(r => r.message).join('\n'))
         }
 
-        console.log('上传成功:', results)
+        console.log('锟较达拷锟缴癸拷:', results)
     }, [selectedMigrationConfigs, onAddMigrateTask])
 
-    // 一键执行选中的操作
     const handleBatchExecute = useCallback(async () => {
         if (selectedItems.size === 0 || !analysisResult) return
         
@@ -664,15 +850,12 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
             selectedItems.has(s.path) && !deletedPaths.has(s.path) && !addedToSafeListPaths.has(s.path)
         )
 
-        // 检查是否有迁移操作且没有配置云存储（使用实际的操作类型）
         const hasMoveItems = itemsToProcess.some(item => {
             const actualAction = getActualAction(item.path, item.action)
             return actualAction === 'move'
         })
         if (hasMoveItems && selectedMigrationConfigs.length === 0) {
-            // 先获取可用的云存储配置
             const configs = await getEnabledCloudStorageConfigs()
-            // 打开选择云存储目标对话框（如果没有配置，对话框内会显示链接到设置）
             setAvailableConfigs(configs)
             setShowCloudSelector(true)
             return
@@ -688,7 +871,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                     await handleDelete(item.path)
                     successCount++
                 } else if (actualAction === 'move') {
-                    // 执行迁移操作
                     const fileSize = parseSizeToBytes(item.size)
                     await handleMove(item.path, selectedMigrationConfigs, '/', fileSize)
                     successCount++
@@ -699,25 +881,19 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
             }
         }
 
-        // 显示完成通知
         if (failCount === 0) {
             showNotification(t('batch.executeComplete'), t('batch.successCount', { count: successCount }))
         } else {
             showNotification(t('batch.executeComplete'), t('batch.successAndFailed', { success: successCount, failed: failCount }))
         }
         
-        // 清空选中状态
         setSelectedItems(new Set())
-    }, [selectedItems, analysisResult, deletedPaths, addedToSafeListPaths, handleDelete, handleMove, selectedMigrationConfigs, getActualAction])
+    }, [selectedItems, analysisResult, deletedPaths, addedToSafeListPaths, handleDelete, handleMove, selectedMigrationConfigs, getActualAction, t])
 
     // 保存快照
     const handleSaveSnapshot = useCallback(() => {
         if (!result || !path) return
-
-        // 默认快照名称：路径的最后一部分 + 时间
-        const pathParts = path.split(/[/\\]/).filter(Boolean)
-        const defaultName = `${pathParts[pathParts.length - 1] || '未命名'} - ${new Date().toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}`
-        setSnapshotName(defaultName)
+        setSnapshotName(buildDefaultSnapshotName(path))
         setShowSaveDialog(true)
     }, [result, path])
 
@@ -725,10 +901,16 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         if (!result || !path || !snapshotName.trim()) return
 
         try {
+            const appSettings = await loadAppSettings()
+            const summary = latestSummary || await buildFileListSummary(result, appSettings.promptFileCount)
             await saveSnapshot({
                 name: snapshotName.trim(),
                 path,
                 scanResult: result,
+                summary,
+                ai_prompt: latestAiPrompt,
+                ai_raw_text: latestAiRawText,
+                ai_structured_result: analysisResult,
             })
             setShowSaveDialog(false)
             setSnapshotName('')
@@ -736,26 +918,21 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         } catch (e) {
             showNotification(t('snapshot.saveFailed'), String(e))
         }
-    }, [result, path, snapshotName])
+    }, [result, path, snapshotName, latestSummary, latestAiPrompt, latestAiRawText, analysisResult, t])
 
-    // 设置迁移目标
     const handleSetMigrationTarget = useCallback(async () => {
         const configs = await getEnabledCloudStorageConfigs()
-        // 打开选择云存储目标对话框（如果没有配置，对话框内会显示链接到设置）
         setAvailableConfigs(configs)
         setShowCloudSelector(true)
     }, [])
 
-    // 处理云存储选择
     const handleCloudStorageSelected = useCallback((configs: CloudStorageConfig[]) => {
         setSelectedMigrationConfigs(configs)
         setShowCloudSelector(false)
 
-        // 更新显示的目标名称（只显示服务商名称）
         if (configs.length === 0) {
             setMigrationTargetNames('')
         } else if (configs.length === 1) {
-            // 获取服务商显示名称
             const providerInfo = CLOUD_STORAGE_PROVIDERS.find(p => p.id === configs[0].provider)
             setMigrationTargetNames(providerInfo?.name || configs[0].provider)
         } else {
@@ -763,57 +940,33 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         }
     }, [])
 
-    // 加载快照
     useEffect(() => {
         if (!loadedSnapshot) return
 
         setPath(loadedSnapshot.path)
         setResult(loadedSnapshot.scanResult)
         setStatus('done')
-        setAnalysisResult(null)
+        setAnalysisResult(loadedSnapshot.ai_structured_result ?? null)
+        setLatestSummary(loadedSnapshot.summary ?? '')
+        setLatestAiPrompt(loadedSnapshot.ai_prompt ?? '')
+        setLatestAiRawText(loadedSnapshot.ai_raw_text ?? '')
         setDeletedPaths(new Set())
         setActionFilter('all')
         setActionOverrides(new Map())
 
-        // 标准模式：加载快照后自动进行 AI 分析
-        if (isAdmin === false) {
-            setAiAnalyzing(true)
-            setAiProgress(t('aiAnalysis.preparing'))
-
-            const runAIAnalysis = async () => {
-                try {
-                    const summary = await buildFileListSummary(loadedSnapshot.scanResult)
-                    const aiResult = await analyzeWithAI(summary, (msg) => setAiProgress(msg))
-                    setAnalysisResult(aiResult)
-                } catch (aiError) {
-                    setErrorMsg(`${t('aiAnalysis.failed')}: ${aiError}`)
-                } finally {
-                    setAiAnalyzing(false)
-                    setAiProgress('')
-                }
-            }
-
-            void runAIAnalysis()
-        }
-
-        // 清除已加载的快照
         onSnapshotLoaded?.()
-    }, [loadedSnapshot, isAdmin, onSnapshotLoaded])
+    }, [loadedSnapshot, onSnapshotLoaded])
 
-    // 核心：API 配置校验
     const [standardModeNoApi, setStandardModeNoApi] = useState(false)
 
-    // 根据文件路径查找对应的任务状态
     const getTaskForPath = useCallback((filePath: string): Task | undefined => {
         return tasks.find(task => task.sourcePath === filePath && (task.status === 'pending' || task.status === 'uploading'))
     }, [tasks])
 
-    // 注册文件删除通知回调，当迁移任务完成并删除文件时调用
     useEffect(() => {
         if (onFileDeleted) {
             const handleFileDeleted = (path: string) => {
                 setDeletedPaths(prev => new Set([...prev, path]))
-                // 从选中项中移除已删除的项
                 setSelectedItems(prev => {
                     const next = new Set(prev)
                     next.delete(path)
@@ -821,7 +974,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                 })
             }
             onFileDeleted(handleFileDeleted)
-            // 清理函数：组件卸载时移除回调
             return () => {
                 onFileDeleted(null)
             }
@@ -846,7 +998,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
 
     return (
         <div className="flex-1 flex flex-col gap-6 p-2 min-h-0 text-slate-800 dark:text-gray-200 font-sans">
-            {/* 核心操作区 */}
             <div className="space-y-3 shrink-0">
                 <div className="bg-white dark:bg-gray-800 px-4 py-3 rounded-2xl shadow-sm border border-slate-100 dark:border-gray-600 flex flex-wrap items-center gap-3">
                     <div className="flex-1 min-w-[260px] relative">
@@ -908,7 +1059,32 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                         >
                             {status === 'scanning' ? t('expertMode.scanning') : t('expertMode.startScan')}
                         </Button>
-                        {/* 只在开发者模式下显示保存快照按钮 */}
+                        {result && status === 'done' && isAdmin === false && (
+                            <Button
+                                onClick={() => void runAiAnalysis(result)}
+                                disabled={aiAnalyzing || standardModeNoApi}
+                                variant="outlined"
+                                size="small"
+                                startIcon={<Sparkles size={14} />}
+                                sx={{
+                                    borderRadius: '10px',
+                                    px: 2,
+                                    py: 0.9,
+                                    color: 'primary.main',
+                                    borderColor: 'primary.main',
+                                    textTransform: 'none',
+                                    fontWeight: 600,
+                                    fontSize: '12px',
+                                    '&:hover': {
+                                        bgcolor: 'primary.main',
+                                        color: '#1A1A1A',
+                                        borderColor: 'primary.main',
+                                    }
+                                }}
+                            >
+                                {aiAnalyzing ? t('aiAnalysis.analyzing') : t('aiAnalysis.start')}
+                            </Button>
+                        )}
                         {result && status === 'done' && isAdmin && (
                             <Tooltip title={t('snapshot.saveSnapshot')} arrow>
                                 <Button
@@ -939,7 +1115,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                     </div>
                 </div>
 
-                {/* 搜索下方：左侧 group(checkbox + 标准/开发者) | 右侧 三个统计 */}
                 <div className="flex items-center justify-between gap-4 flex-wrap">
                     <div className="flex items-center gap-3 px-3 py-2 rounded-xl border border-slate-200/80 dark:border-gray-600 bg-slate-50/50 dark:bg-gray-700/30">
                         <label className="flex items-center gap-2 cursor-pointer group w-fit select-none">
@@ -983,7 +1158,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                     </span>
                                 )}
                                 <div className="flex items-center gap-2">
-                                {/* 一键全选/取消全选按钮 */}
                                 {analysisResult && (() => {
                                     const visibleItems = analysisResult.suggestions
                                         .filter(s => !deletedPaths.has(s.path) && !addedToSafeListPaths.has(s.path))
@@ -1015,7 +1189,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                         </Button>
                                     )
                                 })()}
-                                {/* 一键执行按钮 - 当有选中项时显示 */}
                                 {selectedItems.size > 0 && (
                                     <Button
                                         onClick={handleBatchExecute}
@@ -1058,7 +1231,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                     })()}
                 </div>
 
-                {/* 错误提示与 API 警告 */}
                 <Fade in={status === 'error' || standardModeNoApi}>
                     <div className="space-y-2">
                         {status === 'error' && (
@@ -1082,7 +1254,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                 </Fade>
             </div>
 
-            {/* 扫描中状态：脉动动画，无进度条 */}
             {status === 'scanning' && (
                 <div className="p-10 flex flex-col items-center justify-center gap-4 animate-in zoom-in-95 duration-500">
                     <div className="relative">
@@ -1105,7 +1276,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                 </div>
             )}
 
-            {/* AI 分析中状态（标准模式） */}
             {aiAnalyzing && (
                 <div className="p-10 flex flex-col items-center justify-center gap-4 animate-in zoom-in-95 duration-500">
                     <div className="relative">
@@ -1132,16 +1302,12 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                 </div>
             )}
 
-            {/* 扫描结果展示 */}
             {result && !aiAnalyzing && (
                 <div className="flex-1 flex flex-col gap-4 min-h-0 animate-in slide-in-from-bottom-8 duration-700">
-                    {/* 标准模式：显示 AI 建议列表 */}
                     {isAdmin === false ? (
                         analysisResult ? (
                             <div className="flex-1 flex gap-4 min-h-0 overflow-hidden">
-                                {/* 左侧：饼图和摘要 */}
                                 <div className="w-80 flex flex-col gap-3 shrink-0 overflow-y-auto pr-2" style={{ maxHeight: '100%' }}>
-                                    {/* AI 分析摘要 */}
                                     <div className="bg-white dark:bg-gray-800 px-4 py-3 rounded-xl border border-slate-200 dark:border-gray-600 shadow-sm">
                                         <div className="flex items-center gap-2 mb-2">
                                             <Sparkles size={18} className="text-primary" />
@@ -1160,7 +1326,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                             </Tooltip>
                                         )}
 
-                                        {/* 迁移目标设置按钮 */}
                                         <div className="mt-3 pt-3 border-t border-slate-200 dark:border-gray-700">
                                             <Button
                                                 size="small"
@@ -1194,7 +1359,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                         </div>
                                     </div>
 
-                                    {/* 饼图：删除/迁移/保留占比 */}
                                     {(() => {
                                         const deleteSuggestions = analysisResult.suggestions.filter(s => {
                                             const actualAction = getActualAction(s.path, s.action)
@@ -1205,7 +1369,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                             return actualAction === 'move' && !deletedPaths.has(s.path) && !addedToSafeListPaths.has(s.path)
                                         })
 
-                                        // 解析大小字符串为字节数
                                         const parseSize = (sizeStr: string): number => {
                                             const units: { [key: string]: number } = {
                                                 'B': 1,
@@ -1224,38 +1387,31 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                         const deleteSize = deleteSuggestions.reduce((sum, s) => sum + parseSize(s.size), 0)
                                         const moveSize = moveSuggestions.reduce((sum, s) => sum + parseSize(s.size), 0)
                                         
-                                        // 判断是否为整盘扫描：Windows 如 "C:\"，Unix/macOS 如 "/"
                                         const isVolumeScan = /^[A-Za-z]:[\\/]$/.test(path) || path === '/'
-                                        // 百分比计算基准：整盘扫描用卷容量，文件夹扫描用该文件夹总大小
                                         const baseCapacity = isVolumeScan && result?.volume_total_bytes != null && result.volume_total_bytes > 0
                                             ? result.volume_total_bytes
                                             : (result?.total_size || 1)
                                         const remainSize = Math.max(0, baseCapacity - deleteSize - moveSize)
-                                        // 删除/迁移/保留占比 = 各自容量 / 基准容量，展示时上限 100%
                                         const deletePercent = Math.min(100, (deleteSize / baseCapacity) * 100).toFixed(1)
                                         const movePercent = Math.min(100, (moveSize / baseCapacity) * 100).toFixed(1)
                                         const remainPercent = Math.min(100, (remainSize / baseCapacity) * 100).toFixed(1)
 
-                                        // 检测是否为暗色模式
                                         const isDarkMode = document.documentElement.classList.contains('dark')
 
-                                        // 定义颜色常量 - 删除(红)、迁移(蓝)、保留(灰)
                                         const colors = {
                                             delete: '#ef4444',
                                             move: '#3b82f6',
-                                            keep: isDarkMode ? '#4b5563' : '#e2e8f0',  // 暗色模式下用更深的灰色
+                                            keep: isDarkMode ? '#4b5563' : '#e2e8f0',
                                         }
 
-                                        // 三部分数据：删除、迁移、保留
                                         const pieData = [
                                             { name: t('aiAnalysis.delete'), value: deleteSize, count: deleteSuggestions.length, percent: deletePercent, action: 'delete' as const, color: colors.delete },
                                             { name: t('aiAnalysis.migrate'), value: moveSize, count: moveSuggestions.length, percent: movePercent, action: 'move' as const, color: colors.move },
                                             { name: t('aiAnalysis.keep'), value: remainSize, count: 0, percent: remainPercent, action: 'keep' as const, color: colors.keep },
                                         ].filter(d => d.value > 0)
 
-                                        // 非线性缓动函数
-                                        const springEasing = 'cubic-bezier(0.34, 1.56, 0.64, 1)'  // 弹性回弹
-                                        const smoothEasing = 'cubic-bezier(0.25, 0.46, 0.45, 0.94)'  // 平滑减速
+                                        const springEasing = 'cubic-bezier(0.34, 1.56, 0.64, 1)'
+                                        const smoothEasing = 'cubic-bezier(0.25, 0.46, 0.45, 0.94)'
 
                                         return (
                                             <div className="bg-white dark:bg-gray-800 px-4 py-6 rounded-xl border border-slate-200 dark:border-gray-600 shadow-sm dark:shadow-gray-900/20 flex flex-col items-center gap-3">
@@ -1316,7 +1472,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                                             </Pie>
                                                         </PieChart>
                                                     </ResponsiveContainer>
-                                                    {/* 中心文字 - 根据 hover 状态显示不同内容 */}
                                                     <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                                                         <div className="text-center">
                                                             {(() => {
@@ -1445,7 +1600,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                                             </div>
                                                         </button>
                                                     ))}
-                                                    {/* 保留部分显示 - 使用与饼图一致的颜色 */}
                                                     {pieData.find(d => d.action === 'keep') && (
                                                         <div className="flex items-center justify-between px-3 py-2 text-slate-400 dark:text-gray-400">
                                                             <div className="flex items-center gap-2">
@@ -1481,7 +1635,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                     })()}
                                 </div>
 
-                                {/* 右侧：建议列表 */}
                                 <div className="flex-1 min-w-0 overflow-auto">
                                     {analysisResult.suggestions.length > 0 ? (
                                         <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 pr-2">
@@ -1493,7 +1646,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                                 })
                                                 .map((suggestion, idx) => {
                                                     const actualAction = getActualAction(suggestion.path, suggestion.action)
-                                                    // 创建修改后的建议对象，使用实际的操作类型
                                                     const modifiedSuggestion = {
                                                         ...suggestion,
                                                         action: actualAction
@@ -1529,14 +1681,44 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                     )}
                                 </div>
                             </div>
-                        ) : null
+                        ) : (
+                            <div className="flex-1 flex flex-col items-center justify-center gap-4 text-slate-500 dark:text-gray-400">
+                                <CheckCircle2 size={44} className="text-primary" />
+                                <Typography variant="body1" sx={{ fontWeight: 700 }}>
+                                    {t('expertMode.scanComplete')}
+                                </Typography>
+                                <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                                    {t('aiAnalysis.scanCompleteHint')}
+                                </Typography>
+                                <Button
+                                    onClick={() => void runAiAnalysis(result)}
+                                    disabled={aiAnalyzing || standardModeNoApi}
+                                    variant="contained"
+                                    size="small"
+                                    startIcon={<Sparkles size={14} />}
+                                    sx={{
+                                        borderRadius: '10px',
+                                        px: 3,
+                                        py: 0.9,
+                                        bgcolor: 'primary.main',
+                                        color: '#1A1A1A',
+                                        fontWeight: 700,
+                                        fontSize: '12px',
+                                        textTransform: 'none',
+                                        boxShadow: 'none',
+                                        '&:hover': { bgcolor: 'primary.dark', color: '#1A1A1A' }
+                                    }}
+                                >
+                                    {t('aiAnalysis.start')}
+                                </Button>
+                            </div>
+                        )
                     ) : (
-                        /* 开发者模式：显示原有的分布视图和 AI 指令 */
                         <div className="flex-1 flex flex-col min-h-0 bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-slate-100 dark:border-gray-600 overflow-hidden">
                             <div className="px-3 py-2 flex items-center justify-between border-b border-slate-100 dark:border-gray-600 shrink-0">
                                 <div className="bg-slate-200/50 dark:bg-gray-600/50 p-0.5 rounded-lg flex gap-0.5 border border-slate-200/80 dark:border-gray-600">
-                                    <button onClick={() => setViewMode('disk')} className={`px-3 py-1 rounded-md text-[11px] font-semibold transition-all ${viewMode === 'disk' ? 'bg-white dark:bg-gray-600 text-secondary shadow-sm' : 'text-slate-500 dark:text-gray-400'}`}>{t('expertMode.diskView')}</button>
-                                    <button onClick={() => setViewMode('ai-prompt')} className={`px-3 py-1 rounded-md text-[11px] font-semibold transition-all ${viewMode === 'ai-prompt' ? 'bg-secondary text-primary shadow-sm' : 'text-slate-500 dark:text-gray-400'}`}>{t('expertMode.aiInstructions')}</button>
+                                    <button onClick={() => switchViewMode('disk')} className={`px-3 py-1 rounded-md text-[11px] font-semibold transition-all ${viewMode === 'disk' ? 'bg-white dark:bg-gray-600 text-secondary shadow-sm' : 'text-slate-500 dark:text-gray-400'}`}>{t('expertMode.diskView')}</button>
+                                    <button onClick={() => switchViewMode('ai-prompt')} className={`px-3 py-1 rounded-md text-[11px] font-semibold transition-all ${viewMode === 'ai-prompt' ? 'bg-secondary text-primary shadow-sm' : 'text-slate-500 dark:text-gray-400'}`}>{t('expertMode.aiInstructions')}</button>
                                 </div>
                                 {hoverNode && viewMode === 'disk' && (
                                     <div className="px-3 py-1.5 bg-secondary text-primary rounded-lg text-[11px] font-semibold flex gap-2 items-center">
@@ -1562,7 +1744,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                 </div>
             )}
 
-            {/* 空白页：仅图标+选择文件夹可点击，hover 仅作用于该区域 */}
             {status === 'idle' && !result && (
                 <div className="flex-1 flex flex-col items-center justify-center min-h-0">
                     <button
@@ -1578,7 +1759,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                 </div>
             )}
 
-            {/* 保存快照对话框 */}
             <Dialog
                 open={showSaveDialog}
                 onClose={() => setShowSaveDialog(false)}
@@ -1642,7 +1822,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                 </DialogActions>
             </Dialog>
 
-            {/* 加入安全名单确认对话框 */}
             <Dialog
                 open={safeListDialog.open}
                 onClose={() => setSafeListDialog({ open: false, path: null, dontRemind: false })}
@@ -1691,7 +1870,6 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                 </DialogActions>
             </Dialog>
 
-            {/* 云存储选择对话框 */}
             <CloudStorageSelector
                 open={showCloudSelector}
                 onClose={() => setShowCloudSelector(false)}
@@ -1704,3 +1882,5 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         </div>
     );
 }
+
+

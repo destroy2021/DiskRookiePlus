@@ -3,11 +3,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, UNIX_EPOCH};
 
 use ai_disk_common::DiskAnalyzerError;
-use ai_disk_domain::{FileNode, ScanResult};
+use ai_disk_domain::{ExtensionStat, FileNode, ScanResult, SummaryEntry};
 use rayon::prelude::*;
+use std::collections::HashMap;
 
 const MAX_DEPTH: usize = 10;
 const MAX_CHILDREN_PER_DIR: usize = 500;
+const TOP_DIRECTORIES_DEFAULT_N: usize = 100;
+const ROOT_CHILDREN_DEFAULT_N: usize = 100;
+const EXTENSION_STATS_DEFAULT_N: usize = 50;
 
 /// Windows: 文件或目录损坏且无法读取，遇到时跳过该路径继续扫描
 #[cfg(windows)]
@@ -45,6 +49,17 @@ pub(crate) type ProgressCb = Box<dyn Fn(u64, &str) + Send + Sync>;
 
 /// 可共享的进度回调，用于 MFT 加载时在后台线程中上报进度。
 pub(crate) type ProgressCbArc = std::sync::Arc<ProgressCb>;
+
+#[cfg(windows)]
+fn is_expected_mft_fallback(err: &DiskAnalyzerError) -> bool {
+    match err {
+        DiskAnalyzerError::PermissionDenied(_) => true,
+        DiskAnalyzerError::InvalidPath(msg) => {
+            msg.to_ascii_lowercase().contains("empty mft result")
+        }
+        _ => false,
+    }
+}
 
 /// 仅统计目录总大小，不构建子树（用于 shallow 目录）
 fn dir_size_only(
@@ -303,6 +318,102 @@ fn build_tree(
     ))
 }
 
+fn normalize_ext(path: &str) -> String {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::trim)
+    {
+        Some(ext) if !ext.is_empty() => format!(".{}", ext.to_ascii_lowercase()),
+        _ => "[no_ext]".to_string(),
+    }
+}
+
+pub(crate) fn build_scan_summaries(
+    root: &FileNode,
+) -> (Vec<SummaryEntry>, Vec<SummaryEntry>, Vec<ExtensionStat>) {
+    let mut top_directories = Vec::new();
+    let mut ext_stats: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut dir_counts: HashMap<String, (u64, u64)> = HashMap::new();
+
+    fn walk(
+        node: &FileNode,
+        is_root: bool,
+        top_directories: &mut Vec<SummaryEntry>,
+        dir_counts: &mut HashMap<String, (u64, u64)>,
+        ext_stats: &mut HashMap<String, (u64, u64)>,
+    ) -> (u64, u64) {
+        if !node.is_dir {
+            let ext = normalize_ext(&node.path);
+            let stat = ext_stats.entry(ext).or_insert((0, 0));
+            stat.0 = stat.0.saturating_add(node.size);
+            stat.1 = stat.1.saturating_add(1);
+            return (1, 0);
+        }
+
+        let mut file_count = 0u64;
+        let mut dir_count = 0u64;
+        for child in &node.children {
+            let (f, d) = walk(child, false, top_directories, dir_counts, ext_stats);
+            file_count = file_count.saturating_add(f);
+            dir_count = dir_count.saturating_add(d);
+            if child.is_dir {
+                dir_count = dir_count.saturating_add(1);
+            }
+        }
+        dir_counts.insert(node.path.clone(), (file_count, dir_count));
+        if !is_root {
+            top_directories.push(SummaryEntry {
+                path: node.path.clone(),
+                name: node.name.clone(),
+                size: node.size,
+                file_count: Some(file_count),
+                dir_count: Some(dir_count),
+                is_dir: true,
+            });
+        }
+        (file_count, dir_count)
+    }
+
+    walk(
+        root,
+        true,
+        &mut top_directories,
+        &mut dir_counts,
+        &mut ext_stats,
+    );
+
+    top_directories.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    top_directories.truncate(TOP_DIRECTORIES_DEFAULT_N);
+
+    let mut root_children: Vec<SummaryEntry> = root
+        .children
+        .iter()
+        .map(|child| {
+            let (file_count, dir_count) = dir_counts.get(&child.path).copied().unwrap_or((0, 0));
+            SummaryEntry {
+                path: child.path.clone(),
+                name: child.name.clone(),
+                size: child.size,
+                file_count: child.is_dir.then_some(file_count),
+                dir_count: child.is_dir.then_some(dir_count),
+                is_dir: child.is_dir,
+            }
+        })
+        .collect();
+    root_children.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    root_children.truncate(ROOT_CHILDREN_DEFAULT_N);
+
+    let mut extension_stats: Vec<ExtensionStat> = ext_stats
+        .into_iter()
+        .map(|(ext, (size, count))| ExtensionStat { ext, size, count })
+        .collect();
+    extension_stats.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| b.count.cmp(&a.count)));
+    extension_stats.truncate(EXTENSION_STATS_DEFAULT_N);
+
+    (top_directories, root_children, extension_stats)
+}
+
 /// 规范化路径（支持正斜杠、去除首尾空白）
 pub(crate) fn normalize_path(path: &str) -> std::path::PathBuf {
     let s = path.trim();
@@ -386,11 +497,18 @@ pub fn scan_path_with_progress(
             Ok(result) => return Ok((result, true)),
             Err(e) => {
                 let msg: String = e.to_string();
-                stderr_ln!(
-                    "[scan] MFT scan unavailable, falling back to normal walk. reason: {} (on Windows, reading $MFT often needs admin)",
-                    msg
-                );
-                mft_fallback_reason = Some(msg);
+                if is_expected_mft_fallback(&e) {
+                    stderr_ln!(
+                        "[scan] MFT unavailable (expected fallback), reason: {}. falling back to normal walk.",
+                        msg
+                    );
+                } else {
+                    stderr_ln!(
+                        "[scan] MFT scan unavailable, falling back to normal walk. reason: {}",
+                        msg
+                    );
+                    mft_fallback_reason = Some(msg);
+                }
             }
         }
     }
@@ -413,6 +531,7 @@ pub fn scan_path_with_progress(
     )?;
     let scan_time_ms = start.elapsed().as_millis() as u64;
     let total_size = root.size;
+    let (top_directories, root_children, extension_stats) = build_scan_summaries(&root);
 
     let (volume_total_bytes, volume_free_bytes) = get_volume_space_for_result_path(&path_buf);
 
@@ -426,6 +545,9 @@ pub fn scan_path_with_progress(
             volume_total_bytes,
             volume_free_bytes,
             top_files: None,
+            top_directories,
+            root_children,
+            extension_stats,
         },
         false,
     ))
@@ -491,6 +613,9 @@ mod tests {
         assert!(result.total_size >= 10);
 
         assert!(!result.root.children.is_empty());
+        assert!(!result.top_directories.is_empty());
+        assert!(!result.root_children.is_empty());
+        assert!(!result.extension_stats.is_empty());
     }
 
     #[test]
@@ -501,5 +626,66 @@ mod tests {
             let result = scan_path(path).unwrap();
             assert!(result.root.name == "Academic" || !result.root.path.is_empty());
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_expected_mft_fallback_cases() {
+        assert!(is_expected_mft_fallback(
+            &DiskAnalyzerError::PermissionDenied("admin".to_string())
+        ));
+        assert!(is_expected_mft_fallback(&DiskAnalyzerError::InvalidPath(
+            "empty MFT result".to_string()
+        )));
+        assert!(!is_expected_mft_fallback(&DiskAnalyzerError::InvalidPath(
+            "x".to_string()
+        )));
+    }
+
+    #[test]
+    fn test_scan_summary_fields_sorted_and_limited() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("large")).unwrap();
+        fs::create_dir_all(root.join("small")).unwrap();
+        fs::create_dir_all(root.join("empty")).unwrap();
+        File::create(root.join("large").join("a.log"))
+            .unwrap()
+            .write_all(&vec![1u8; 16])
+            .unwrap();
+        File::create(root.join("large").join("b.log"))
+            .unwrap()
+            .write_all(&vec![2u8; 8])
+            .unwrap();
+        File::create(root.join("small").join("c.txt"))
+            .unwrap()
+            .write_all(&vec![3u8; 4])
+            .unwrap();
+        File::create(root.join("README"))
+            .unwrap()
+            .write_all(&vec![4u8; 2])
+            .unwrap();
+
+        let result = scan_path(root.to_string_lossy().as_ref()).unwrap();
+        assert!(!result.top_directories.is_empty());
+        assert!(!result.root_children.is_empty());
+        assert!(!result.extension_stats.is_empty());
+        assert!(result.top_directories.len() <= TOP_DIRECTORIES_DEFAULT_N);
+        assert!(result.root_children.len() <= ROOT_CHILDREN_DEFAULT_N);
+        assert!(result.extension_stats.len() <= EXTENSION_STATS_DEFAULT_N);
+        assert!(result
+            .top_directories
+            .windows(2)
+            .all(|w| w[0].size >= w[1].size));
+        assert!(result
+            .root_children
+            .windows(2)
+            .all(|w| w[0].size >= w[1].size));
+        assert!(result
+            .extension_stats
+            .windows(2)
+            .all(|w| w[0].size >= w[1].size));
+        assert!(result.extension_stats.iter().any(|e| e.ext == ".log"));
+        assert!(result.extension_stats.iter().any(|e| e.ext == ".txt"));
     }
 }

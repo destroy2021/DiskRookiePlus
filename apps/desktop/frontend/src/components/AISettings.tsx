@@ -62,12 +62,12 @@ import { loadSafeListPaths, saveSafeListPaths } from '../services/safeList'
 
 interface Props {
   onClose: () => void
-  initialTab?: number  // 允许外部指定初始 Tab
-  onSaved?: () => void  // 保存成功后的回调
-  themePreference?: 'light' | 'dark' | 'system'  // 主题偏好
-  onThemeChange?: (theme: 'light' | 'dark' | 'system') => void  // 主题改变回调
-  currentLanguage?: string  // 当前语言
-  onLanguageChange?: (lang: string) => void  // 语言改变回调
+  initialTab?: number
+  onSaved?: () => void
+  themePreference?: 'light' | 'dark' | 'system'
+  onThemeChange?: (theme: 'light' | 'dark' | 'system') => void
+  currentLanguage?: string
+  onLanguageChange?: (lang: string) => void
 }
 
 interface TabPanelProps {
@@ -103,7 +103,12 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
   const { t, i18n } = useTranslation()
   const theme = useTheme()
   const [settings, setSettings] = useState<AISettingsType>(DEFAULT_SETTINGS)
-  const [appSettings, setAppSettings] = useState<AppSettings>({ promptFileCount: 100, useMftScan: true })
+  const [appSettings, setAppSettings] = useState<AppSettings>({
+    promptFileCount: 100,
+    useMftScan: true,
+    snapshotSaveDir: 'snapshots',
+    autoSaveAfterAi: false,
+  })
   const [showApiKey, setShowApiKey] = useState(false)
   const [saved, setSaved] = useState(false)
   const [customUrl, setCustomUrl] = useState('')
@@ -126,14 +131,12 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
   const [kimiHasOAuth, setKimiHasOAuth] = useState(false)
   const [kimiAuthTick, setKimiAuthTick] = useState(0)
 
-  // 主题和语言状态（如果外部传入则使用外部值，否则使用内部状态）
   const [internalThemePreference, setInternalThemePreference] = useState<'light' | 'dark' | 'system'>('system')
   const [internalLanguage, setInternalLanguage] = useState<string>(i18n.language)
   
   const themePreference = externalThemePreference ?? internalThemePreference
   const currentLanguage = externalCurrentLanguage ?? internalLanguage
   
-  // 加载主题设置（如果没有外部传入）
   useEffect(() => {
     if (!externalThemePreference) {
       readStorageFile(THEME_STORAGE_FILE).then(stored => {
@@ -144,7 +147,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
     }
   }, [externalThemePreference])
   
-  // 加载语言设置（如果没有外部传入）
   useEffect(() => {
     if (!externalCurrentLanguage) {
       try {
@@ -162,13 +164,11 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
     loadSettings().then(loaded => {
       setSettings(loaded)
       setCustomApiPresets(loaded.customApiPresets ?? [])
-      // 检查是否是自定义 URL
       const urlPreset = API_URL_PRESETS.find(p => p.value === loaded.apiUrl)
       const customPreset = (loaded.customApiPresets ?? []).find(p => p.value === loaded.apiUrl)
       if (!urlPreset && !customPreset) {
         setCustomUrl(loaded.apiUrl)
       }
-      // 检查是否是自定义模型
       const modelPreset = MODEL_PRESETS.find(p => p.value === loaded.model)
       if (!modelPreset) {
         setCustomModel(loaded.model)
@@ -180,7 +180,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
     })
   }, [])
 
-  // Kimi OAuth 是否已有令牌（用于展示与拉模型列表；自定义 URL 指向 Kimi Coding 时同样生效）
   useEffect(() => {
     const pid = getPresetId(settings.apiUrl, customApiPresets)
     const isKimiEndpoint = pid === KIMI_CODE_PRESET_ID || isKimiCodingApiUrl(settings.apiUrl)
@@ -191,7 +190,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
     void loadKimiOAuthToken().then(t => setKimiHasOAuth(!!t?.access_token))
   }, [settings.apiUrl, customApiPresets, kimiAuthTick])
 
-  // 当当前厂商具备有效凭据后，自动获取模型列表
   useEffect(() => {
     let cancelled = false
     const loadModels = async () => {
@@ -220,8 +218,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
     }
   }, [settings.apiUrl, settings.providerApiKeys, kimiAuthTick])
 
-  // 当已有可用模型列表但当前选中不在列表中时，默认选第一个（避免 UI 显示空白）
-  // 排除用户主动选「自定义」的情况：model 为 '' 或 'custom' 时不覆盖
   useEffect(() => {
     if (availableModels.length === 0 || settings.model === 'custom' || settings.model === '') return
     const inList = availableModels.some((m) => m.id === settings.model)
@@ -233,16 +229,13 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
 
   const handleSave = async () => {
     try {
-      // 保存时带上按厂商解析后的 apiKey（供 loadSettings 之外使用）及 providerApiKeys
       await saveSettings({
         ...settings,
         apiKey: (settings.providerApiKeys ?? {})[getPresetId(settings.apiUrl, customApiPresets)] ?? '',
       })
       await saveAppSettings(appSettings)
       setSaved(true)
-      // 通知父组件保存成功
       onSaved?.()
-      // 保存成功后短暂显示「已保存」再自动关闭对话框
       setTimeout(() => {
         setSaved(false)
         onClose()
@@ -250,6 +243,11 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
     } catch (error) {
       showNotification(t('settings.saveFailed'), String(error))
     }
+  }
+
+  const persistAppSettings = async (next: AppSettings) => {
+    await saveAppSettings(next)
+    setAppSettings(await loadAppSettings())
   }
 
   const handleUrlChange = (value: string) => {
@@ -278,13 +276,11 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
 
   const allApiPresets = [...API_URL_PRESETS.filter(p => p.value !== 'custom'), ...customApiPresets, { id: 'custom', label: t('common.custom'), value: 'custom' }]
   const isCustomUrl = !allApiPresets.some(p => p.value !== 'custom' && p.value === settings.apiUrl)
-  // 有 API 拉取的模型列表时：仅当当前 model 不在该列表中才视为「自定义」；否则用静态预设判断（避免 reasoner 等被误判为自定义）
   const isCustomModel =
     availableModels.length > 0
       ? !availableModels.some((m) => m.id === settings.model)
       : !MODEL_PRESETS.some((p) => p.value === settings.model && p.value !== 'custom')
 
-  // 当前选中的厂商对应的 API Key（独立存储，切换厂商显示各自的 key）
   const currentPresetId = getPresetId(settings.apiUrl, customApiPresets)
   const currentApiKey = (settings.providerApiKeys ?? {})[currentPresetId] ?? ''
   const isKimiCodeEndpoint =
@@ -297,7 +293,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center rounded-[12px] z-50">
       <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg mx-4 max-h-[90vh] overflow-hidden flex flex-col border border-transparent dark:border-gray-600">
-        {/* 标题栏 */}
         <div className="flex items-center justify-between p-4 border-b border-border dark:border-gray-600">
           <div className="flex items-center gap-2">
             <div className="w-1 h-5 bg-primary rounded"></div>
@@ -317,7 +312,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
           </IconButton>
         </div>
 
-        {/* Tabs 导航 */}
         <Box sx={{ borderBottom: 1, borderColor: 'divider' }} className="dark:!border-gray-600">
           <Tabs
             value={activeTab}
@@ -363,9 +357,7 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
           </Tabs>
         </Box>
 
-        {/* 内容区：min-h-0 让 flex 子项可收缩，内部 TabPanel 才能正常滚动 */}
         <div className="flex-1 min-h-0 overflow-hidden flex flex-col bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100">
-          {/* AI 模型设置 Tab */}
           <TabPanel value={activeTab} index={0}>
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5 }}>
               {/* API URL */}
@@ -458,7 +450,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                                 }
                               },
                             })
-                            // 清除该端点下曾保存的手动 Key，避免继续覆盖 OAuth（与 resolveEffectiveApiKey 行为一致）
                             const loaded = await loadSettings()
                             const pid = getPresetId(loaded.apiUrl, loaded.customApiPresets ?? [])
                             const isKimi =
@@ -515,7 +506,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                   </Box>
                 )}
 
-                {/* Kimi 已通过 OAuth 登录时不显示手动 API Key，避免重复说明；未登录或非 Kimi 预设仍显示 */}
                 {(!isKimiCodeEndpoint || !kimiHasOAuth) && (
                   <>
                     <TextField
@@ -550,7 +540,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                     </FormHelperText>
                   </>
                 )}
-                {/* 测试连接 - 填写了 API Key、地址和模型后显示，响应信息显示在按钮右侧 */}
                 {hasCredential && settings.apiUrl && settings.model && (
                   <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1.5, mt: 0.5, flexWrap: 'wrap' }}>
                     <Button
@@ -593,7 +582,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                 )}
               </Box>
 
-              {/* 模型选择 - 具备凭据后显示 */}
               {hasCredential && (
                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
                   <Typography variant="caption" sx={{ fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'text.secondary' }}>
@@ -648,7 +636,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                           },
                         }}
                       >
-                        {/* 显示从 API 获取的模型：用 onClick 显式处理点击，避免 portaled 菜单在部分环境下无响应 */}
                         {availableModels.length > 0 ? (
                           <>
                             {availableModels
@@ -708,7 +695,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                 </Box>
               )}
 
-              {/* 高级设置 - 使用 Accordion 实现折叠 */}
               <Accordion
                 expanded={advancedExpanded}
                 onChange={(_, expanded) => setAdvancedExpanded(expanded)}
@@ -778,7 +764,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                       </FormHelperText>
                     </Box>
 
-                    {/* Prompt File Count（与开发者模式表格行数共用同一配置，范围 20–2000） */}
                     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
                       <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                         <Typography variant="body2" sx={{ color: 'text.primary' }}>{t('settings.promptFileCount')}</Typography>
@@ -810,15 +795,12 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
             </Box>
           </TabPanel>
 
-          {/* 云盘服务设置 Tab */}
           <TabPanel value={activeTab} index={1}>
             <CloudStorageSettings />
           </TabPanel>
 
-          {/* 通用设置 Tab */}
           <TabPanel value={activeTab} index={2}>
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5 }}>
-              {/* 主题设置 */}
               <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
                 <Typography variant="caption" sx={{ fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'text.secondary' }}>
                   {t('settings.theme')}
@@ -844,7 +826,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                 </FormControl>
               </Box>
 
-              {/* 语言设置 */}
               <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
                 <Typography variant="caption" sx={{ fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'text.secondary' }}>
                   {t('language.title')}
@@ -872,7 +853,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                 </FormControl>
               </Box>
 
-              {/* MFT 加速扫描（仅 Windows 磁盘根路径有效） */}
               <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
                 <FormControlLabel
                   control={
@@ -880,8 +860,7 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                       checked={appSettings.useMftScan !== false}
                       onChange={async (_, checked) => {
                         const next = { ...appSettings, useMftScan: checked }
-                        setAppSettings(next)
-                        await saveAppSettings(next)
+                        await persistAppSettings(next)
                       }}
                       size="small"
                     />
@@ -893,7 +872,50 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                 </FormHelperText>
               </Box>
 
-              {/* 安全名单管理 */}
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                <Typography variant="caption" sx={{ fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'text.secondary' }}>
+                  {t('settings.snapshotSaveDir')}
+                </Typography>
+                <TextField
+                  size="small"
+                  fullWidth
+                  value={appSettings.snapshotSaveDir ?? 'snapshots'}
+                  onChange={(e) => setAppSettings(s => ({ ...s, snapshotSaveDir: e.target.value }))}
+                  onBlur={() => {
+                    void persistAppSettings(appSettings)
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      void persistAppSettings(appSettings)
+                    }
+                  }}
+                  sx={{ '& .MuiOutlinedInput-root': { borderRadius: '10px' } }}
+                />
+                <FormHelperText sx={{ mt: -0.5, ml: 0 }}>
+                  {t('settings.snapshotSaveDirHint')}
+                </FormHelperText>
+              </Box>
+
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={appSettings.autoSaveAfterAi === true}
+                      onChange={async (_, checked) => {
+                        const next = { ...appSettings, autoSaveAfterAi: checked }
+                        await persistAppSettings(next)
+                      }}
+                      size="small"
+                    />
+                  }
+                  label={t('settings.autoSaveAfterAi')}
+                />
+                <FormHelperText sx={{ mt: -0.5, ml: 0 }}>
+                  {t('settings.autoSaveAfterAiHint')}
+                </FormHelperText>
+              </Box>
+
               <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
                 <Typography variant="caption" sx={{ fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'text.secondary' }}>
                   {t('safeList.safeListTitle')}
@@ -920,7 +942,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
           </TabPanel>
         </div>
 
-        {/* 保存为 API 地址预设对话框 */}
         <Dialog
           open={showSavePresetDialog}
           onClose={() => setShowSavePresetDialog(false)}
@@ -1001,7 +1022,6 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
           </DialogActions>
         </Dialog>
 
-        {/* 安全名单管理对话框 */}
         <Dialog
           open={showSafeListDialog}
           onClose={() => setShowSafeListDialog(false)}
@@ -1092,13 +1112,17 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
           </DialogActions>
         </Dialog>
 
-        {/* 底部按钮 */}
         <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', p: 2, borderTop: 1, borderColor: 'divider', bgcolor: 'action.hover' }} className="dark:!bg-gray-700/50 dark:!border-gray-600">
           {activeTab === 0 ? (
             <Button
               onClick={() => {
                 setSettings(DEFAULT_SETTINGS)
-                setAppSettings({ promptFileCount: 100, useMftScan: true })
+                setAppSettings({
+                  promptFileCount: 100,
+                  useMftScan: true,
+                  snapshotSaveDir: 'snapshots',
+                  autoSaveAfterAi: false,
+                })
                 setCustomUrl('')
                 setCustomModel('')
               }}
@@ -1167,3 +1191,5 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
     </div>
   )
 }
+
+

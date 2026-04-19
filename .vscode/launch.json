@@ -1,0 +1,85 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Tauri Dev (Debug)",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}/apps/desktop",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "tauri", "dev"],
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "openOnSessionStart"
+    },
+    {
+      "name": "Tauri Build",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}/apps/desktop",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "tauri", "build"],
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "openOnSessionStart"
+    },
+    {
+      "name": "Frontend Dev",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}/apps/desktop/frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "openOnSessionStart"
+    },
+    {
+      "name": "Cargo Run (Backend Only)",
+      "type": "lldb",
+      "request": "launch",
+      "name": "Rust Debug",
+      "cargo": {
+        "args": [
+          "run",
+          "--manifest-path=${workspaceFolder}/apps/desktop/src-tauri/Cargo.toml"
+        ],
+        "filter": {
+          "name": "DiskRookie",
+          "kind": "bin"
+        }
+      },
+      "cwd": "${workspaceFolder}/apps/desktop/src-tauri"
+    },
+    {
+      "name": "Cargo Build",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["build", "--release"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Clippy Check",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Cargo Test",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["test", "--workspace"],
+      "console": "integratedTerminal"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Full Dev (Frontend + Backend)",
+      "configurations": ["Frontend Dev", "Cargo Run (Backend Only)"]
+    }
+  ]
+}

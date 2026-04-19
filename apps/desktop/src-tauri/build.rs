@@ -1,15 +1,20 @@
 fn main() {
     #[cfg(target_os = "windows")]
     {
-        // 请求以管理员权限运行：启动时弹出 UAC，用户同意后以管理员身份运行
+        let profile = std::env::var("PROFILE").unwrap_or_default();
+        let level = if profile == "release" {
+            "requireAdministrator"
+        } else {
+            "asInvoker"
+        };
         let mut windows = tauri_build::WindowsAttributes::new();
-        windows = windows.app_manifest(
+        windows = windows.app_manifest(format!(
             r#"
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+        <requestedExecutionLevel level="{level}" uiAccess="false" />
       </requestedPrivileges>
     </security>
   </trustInfo>
@@ -20,8 +25,8 @@ fn main() {
     </dependentAssembly>
   </dependency>
 </assembly>
-"#,
-        );
+"#
+        ));
         let attrs = tauri_build::Attributes::new().windows_attributes(windows);
         tauri_build::try_build(attrs).expect("failed to run build script");
     }

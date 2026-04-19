@@ -316,6 +316,7 @@ export function SnapshotDialog({ open, onClose, onLoadSnapshot }: Props) {
                         </Box>
                       </Box>
                     }
+                    secondaryTypographyProps={{ component: 'div' }}
                   />
                 </ListItemButton>
               </ListItem>

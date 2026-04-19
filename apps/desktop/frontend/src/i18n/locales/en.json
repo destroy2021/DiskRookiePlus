@@ -60,6 +60,7 @@
     "selectFolder": "Select Folder",
     "startScan": "Start Scan",
     "scanning": "Scanning...",
+    "scanComplete": "Scan complete",
     "saveSnapshot": "Save Snapshot",
     "analyzeDiskUsage": "Analyze disk usage",
     "shallowDirs": "Quick scan mode",
@@ -79,6 +80,7 @@
     "scanHasError": "This disk scan had an error (continued with normal scan)"
   },
   "aiAnalysis": {
+    "start": "Start AI Analysis",
     "preparing": "Preparing AI analysis...",
     "calling": "Calling AI analysis...",
     "parsing": "Parsing AI suggestions...",
@@ -110,6 +112,7 @@
     "items": "items",
     "setMigrationTarget": "Set Migration Target",
     "migrateTo": "Migrate to:"
+    ,"scanCompleteHint": "The scan is complete. Click the button to start AI analysis."
   },
   "snapshot": {
     "management": "Snapshot Management",
@@ -133,7 +136,7 @@
     "saveSnapshot": "Save Snapshot",
     "snapshotName": "Snapshot Name",
     "inputSnapshotName": "Give this snapshot a name...",
-    "saveHint2": "Snapshot will save scan results, excluding AI analysis",
+    "saveHint2": "Snapshot includes scan data, summary, AI prompt, raw output and structured results",
     "justNow": "Just now",
     "minutesAgo": "{{count}} minutes ago",
     "hoursAgo": "{{count}} hours ago",
@@ -268,6 +271,10 @@
     "testConnectionFailed": "LLM connection failed",
     "useMftScan": "Use MFT to speed up disk root scan",
     "useMftScanHint": "When enabled, use NTFS MFT for volume roots (e.g. C:\\, D:\\) on Windows",
+    "snapshotSaveDir": "Snapshot Save Directory",
+    "snapshotSaveDirHint": "Relative to app storage root (default: snapshots)",
+    "autoSaveAfterAi": "Auto save snapshot after AI analysis",
+    "autoSaveAfterAiHint": "When enabled, automatically saves scan + summary + AI results after each analysis",
     "saveAsPreset": "Save as API URL preset",
     "saveAsPresetHint": "Save the current API URL as a preset so you can select it from the dropdown next time. We recommend testing the connection first.",
     "presetNamePlaceholder": "Enter preset name, e.g. My DeepSeek",

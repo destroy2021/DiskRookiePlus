@@ -26,7 +26,9 @@ use ntfs_reader::mft::Mft;
 use ntfs_reader::volume::Volume;
 use rayon::prelude::*;
 
-use crate::scanner::{normalize_path, ProgressCb, ProgressCbArc, SHALLOW_DIR_NAMES};
+use crate::scanner::{
+    build_scan_summaries, normalize_path, ProgressCb, ProgressCbArc, SHALLOW_DIR_NAMES,
+};
 
 /// 通过 Windows API GetDiskFreeSpaceExW 获取卷总容量与剩余空间（字节）。
 /// 仅 Windows 有效；path 为卷上任意路径（如 "C:\" 或 "C:\Users"）。
@@ -77,14 +79,22 @@ fn drive_letter_from_volume_root(volume_root: &Path) -> Option<String> {
 }
 
 fn to_disk_analyzer_error(e: NtfsReaderError) -> DiskAnalyzerError {
-    let msg = match &e {
-        NtfsReaderError::ElevationError => {
-            "NTFS volume access requires elevated (admin) privileges".to_string()
+    match e {
+        NtfsReaderError::ElevationError => DiskAnalyzerError::PermissionDenied(
+            "NTFS volume access requires elevated (admin) privileges".to_string(),
+        ),
+        NtfsReaderError::IOError(io) if io.kind() == std::io::ErrorKind::PermissionDenied => {
+            DiskAnalyzerError::PermissionDenied(format!("MFT access denied: {}", io))
         }
-        NtfsReaderError::IOError(io) => format!("MFT read I/O error: {}", io),
-        _ => format!("MFT error: {}", e),
-    };
-    DiskAnalyzerError::Io(std::io::Error::new(std::io::ErrorKind::Other, msg))
+        NtfsReaderError::IOError(io) => DiskAnalyzerError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("MFT read I/O error: {}", io),
+        )),
+        other => DiskAnalyzerError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("MFT error: {}", other),
+        )),
+    }
 }
 
 /// Normalize path from ntfs-reader (e.g. `\\.\F:\dir\file` 或 `C:\dir\file`) to `F:\dir\file`，
@@ -372,12 +382,9 @@ pub fn scan_volume_mft(
     let volume_root_key = format!(r"{}:\", drive);
     // 使用上游 ntfs-reader API：Mft::new 一次性加载 $MFT，再 iterate_files 枚举。
     let volume = Volume::new(volume_path.as_str()).map_err(to_disk_analyzer_error)?;
-    stderr_ln!("[scan:mft] volume opened: {} bytes", volume.volume_size);
+    stderr_ln!("[scan:mft] volume opened");
     let mft = Mft::new(volume).map_err(to_disk_analyzer_error)?;
-    stderr_ln!(
-        "[scan:mft] MFT loaded into memory, max_records={}",
-        mft.max_record
-    );
+    stderr_ln!("[scan:mft] MFT loaded into memory");
     let vol_trim_for_filter = format!("{}:", drive);
     let mut records: Vec<MftRecord> = Vec::with_capacity(2_000_000);
     let mut child_index: HashMap<String, Vec<usize>> = HashMap::new();
@@ -432,18 +439,23 @@ pub fn scan_volume_mft(
             .or_insert(s);
     });
     let n_records = counter.load(Ordering::Relaxed);
+    if n_records == 0 {
+        return Err(DiskAnalyzerError::InvalidPath(
+            "empty MFT result".to_string(),
+        ));
+    }
     let n_filtered = filtered_count.load(Ordering::Relaxed);
     let size_filtered = filtered_file_size.load(Ordering::Relaxed);
     if n_filtered > 0 || size_filtered > 0 {
         stderr_ln!(
             "[scan:mft] path 过滤: {} 条记录、{} 字节(文件)被排除",
-            n_filtered, size_filtered
+            n_filtered,
+            size_filtered
         );
     }
     if let Some(ref cb) = progress {
         cb(n_records, &volume_root_str);
     }
-    let _volume = mft.volume.clone();
     let recursive_sizes = compute_recursive_sizes(
         &records,
         &child_index,
@@ -528,6 +540,7 @@ pub fn scan_volume_mft(
             None => (None, None),
         };
 
+    let (top_directories, root_children, extension_stats) = build_scan_summaries(&root);
     let root_pruned = prune_tree_for_display(root, 0);
     let top_files = Some(build_top_files_from_records(&records, TOP_FILES_FOR_RESULT));
 
@@ -540,6 +553,9 @@ pub fn scan_volume_mft(
         volume_total_bytes,
         volume_free_bytes,
         top_files,
+        top_directories,
+        root_children,
+        extension_stats,
     })
 }
 
@@ -831,4 +847,22 @@ fn build_subtree_from_indices(
         children,
     };
     (node, file_count + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elevation_error_maps_to_permission_denied() {
+        let err = to_disk_analyzer_error(NtfsReaderError::ElevationError);
+        assert!(matches!(err, DiskAnalyzerError::PermissionDenied(_)));
+    }
+
+    #[test]
+    fn io_permission_denied_maps_to_permission_denied() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let err = to_disk_analyzer_error(NtfsReaderError::IOError(io));
+        assert!(matches!(err, DiskAnalyzerError::PermissionDenied(_)));
+    }
 }

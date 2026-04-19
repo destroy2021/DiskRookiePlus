@@ -371,3 +371,9 @@ target/x86_64-pc-windows-msvc/release/bundle/
 
 - QQ 群：[点击加入](https://qm.qq.com/cgi-bin/qm/qr?k=m_GRedABaOwTCseJQnKi_sjMlS_cIhtx)
 - 许可证：Apache License 2.0
+
+## 已验证经验
+
+- 若 `tauri dev/build` 报 `failed to run 'cargo metadata'`，先检查 workspace 成员的 `Cargo.toml` 是否缺失；本仓库曾因 `crates/ntfs-reader/` 为空导致批处理脚本失败。
+- Windows 下仅为通过 `cargo metadata` / 依赖解析时，可先补最小 `ntfs-reader` stub crate，后续再替换为真实实现。
+- 若 Windows 卷根（如 `C:\`/`D:\`）扫描结果为 `0` 文件，优先检查 `crates/ntfs-reader/src/lib.rs` 是否仍为 stub；stub 的 `iterate_files()` 不返回记录，会让 MFT 扫描“成功但为空”。可在 `crates/disk-scanner/src/mft_scan.rs` 中对空 MFT 结果直接返回错误，让 `scanner.rs` 自动回退普通遍历，避免前端显示 0 文件。
