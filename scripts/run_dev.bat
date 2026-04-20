@@ -46,10 +46,25 @@ if not exist "node_modules" (
 echo.
 
 set "DEV_MODE=%~1"
+set "OPT_MODE=%~2"
+
+if /i "%DEV_MODE%"=="tauri-clean" (
+    set "DEV_MODE=tauri"
+    set "OPT_MODE=clean"
+)
+
 if /i "%DEV_MODE%"=="tauri" (
+    if /i "%OPT_MODE%"=="clean" (
+        set "DISKROOKIE_TARGET_OPT_AGGRESSIVE=1"
+        echo [target-opt] Aggressive cleanup enabled for this run
+        echo.
+    )
     echo ========================================
     echo    Start Full Tauri Dev Mode
     echo    Hint: Rust + Frontend will start
+    if /i "%OPT_MODE%"=="clean" (
+        echo    Extra: aggressive target/debug cleanup enabled
+    )
     echo ========================================
     echo.
     call npm run dev:tauri
@@ -58,6 +73,7 @@ if /i "%DEV_MODE%"=="tauri" (
     echo    Start Fast Frontend Dev Mode
     echo    Hint: no Rust compile by default
     echo    Run run_dev.bat tauri for full mode
+    echo    Run run_dev.bat tauri clean to force cleanup
     echo ========================================
     echo.
     call npm run dev

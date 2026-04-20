@@ -373,7 +373,7 @@ async fn upload_to_google_drive_resumable(
             let progress = ((uploaded as f64 / file_size as f64) * 100.0) as u32;
             if progress > last_progress {
                 last_progress = progress;
-                info!("上传进度: {}% ({}/{} bytes)", progress, uploaded, file_size);
+                debug!("上传进度: {}% ({}/{} bytes)", progress, uploaded, file_size);
 
                 let _ = app.emit(
                     "upload-progress",

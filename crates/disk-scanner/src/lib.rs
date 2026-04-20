@@ -11,7 +11,10 @@ pub mod mft_scan;
 pub use ai_disk_domain::ScanResult;
 pub use filters::*;
 pub use node::*;
-pub use scanner::{scan_path, scan_path_with_progress, scan_will_use_mft};
+pub use scanner::{
+    scan_path, scan_path_with_progress, scan_path_with_progress_and_cancel, scan_will_use_mft,
+    CancelFlagArc,
+};
 
 pub use ai_disk_domain::TopFileEntry;
 #[cfg(windows)]

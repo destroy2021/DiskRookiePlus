@@ -31,7 +31,8 @@ tiny_http = "0.12"
 urlencoding = "2"
 dotenvy_macro = "0.15"
 log = "0.4"
-env_logger = "0.11"
+fern = "0.7"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures = "0.3"
 
 # Workspace crates

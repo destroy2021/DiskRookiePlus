@@ -3,6 +3,7 @@ pub mod cloud_upload;
 pub mod delete;
 pub mod execute;
 pub mod kimi_oauth;
+pub mod logging;
 pub mod oauth;
 pub mod open_in_file_manager;
 pub mod permission;

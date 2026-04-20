@@ -550,6 +550,7 @@ pub fn scan_volume_mft(
         file_count,
         total_size,
         scan_warning: None,
+        interrupted: false,
         volume_total_bytes,
         volume_free_bytes,
         top_files,

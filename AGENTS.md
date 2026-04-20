@@ -377,3 +377,9 @@ target/x86_64-pc-windows-msvc/release/bundle/
 - 若 `tauri dev/build` 报 `failed to run 'cargo metadata'`，先检查 workspace 成员的 `Cargo.toml` 是否缺失；本仓库曾因 `crates/ntfs-reader/` 为空导致批处理脚本失败。
 - Windows 下仅为通过 `cargo metadata` / 依赖解析时，可先补最小 `ntfs-reader` stub crate，后续再替换为真实实现。
 - 若 Windows 卷根（如 `C:\`/`D:\`）扫描结果为 `0` 文件，优先检查 `crates/ntfs-reader/src/lib.rs` 是否仍为 stub；stub 的 `iterate_files()` 不返回记录，会让 MFT 扫描“成功但为空”。可在 `crates/disk-scanner/src/mft_scan.rs` 中对空 MFT 结果直接返回错误，让 `scanner.rs` 自动回退普通遍历，避免前端显示 0 文件。
+- 快照能力实现约定：统一通过 `saveSnapshot()` 写入快照文件，文件名由扫描路径自动生成为 `[目录名或盘符]_snapshot_YYYYMMDD_HHmmss(.json)`；手动保存与 AI 自动保存都应复用同一入口，避免命名和序列化分叉。
+- `snapshotSaveDir` 仅作为运行数据根目录（`~/.disk-rookie`）下的相对目录配置，默认 `snapshots`；设置文案需明确“默认运行目录/snapshots/”语义，减少用户对保存位置的歧义。
+- 快照管理右键“打开所在目录”建议通过前端服务统一封装：从 `SnapshotMetadata.file_path`（缺失时回退 `snapshots/<id>.json`）推导目录，再调用 `open_in_file_manager`；对“目录不存在”错误返回可识别结果并在 UI 降级提示，不中断快照加载/删除主流程。
+- AI 分析后快照决策建议使用“会话策略 + 当前弹窗默认动作”两层状态：未静默时每次分析弹窗确认；勾选“本进程不再显示”后记住本进程默认动作（保存/不保存）并在后续分析自动执行。`autoSaveAfterAi` 用于每次弹窗的默认动作来源（开=保存，关=不保存），而不是绕过弹窗逻辑。
+- 标准模式“AI 原文”面板可直接复用 `latestAiRawText` 状态：分析完成后写入、加载快照时从 `ai_raw_text` 恢复，UI 只需新增独立滚动容器展示即可，不必额外引入存储字段。
+- 若 `target/debug` 持续膨胀，优先清理 `target/debug/deps` 下旧 hash 产物（`.rlib/.rmeta/.pdb/.dll` 等）而不只是 `incremental`；可通过 `DISKROOKIE_TARGET_OPT_AGGRESSIVE=1` 或 `run_dev.bat tauri clean` 触发激进清理，脚本会保留每个 crate 的最新 hash 版本以兼顾体积与可重编译性。

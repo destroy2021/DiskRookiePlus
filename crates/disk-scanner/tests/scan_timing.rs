@@ -149,6 +149,7 @@ fn scan_timing_mft_vs_normal() {
                     file_count: 0,
                     total_size: 0,
                     scan_warning: None,
+                    interrupted: false,
                     volume_total_bytes: None,
                     volume_free_bytes: None,
                     top_files: None,

@@ -136,11 +136,7 @@ fn mft_record0_diagnostic() {
     drop(reader);
     let mut reader2 =
         ntfs_reader::aligned_reader::open_volume(volume.path.as_path()).expect("open again");
-    let record = Mft::get_record_fs(
-        &mut reader2,
-        volume.file_record_size,
-        volume.mft_position,
-    );
+    let record = Mft::get_record_fs(&mut reader2, volume.file_record_size, volume.mft_position);
     match &record {
         Ok(_) => eprintln!("[mft_diag] Mft::get_record_fs 成功"),
         Err(e) => eprintln!("[mft_diag] Mft::get_record_fs 失败: {}", e),
@@ -180,11 +176,7 @@ fn mft_record0_same_flow_as_app() {
                     return;
                 }
             };
-            match Mft::get_record_fs(
-                &mut reader,
-                volume.file_record_size,
-                volume.mft_position,
-            ) {
+            match Mft::get_record_fs(&mut reader, volume.file_record_size, volume.mft_position) {
                 Ok(record) => {
                     eprintln!(
                         "[mft_app_flow] iter {} get_record_fs 成功, len={}",

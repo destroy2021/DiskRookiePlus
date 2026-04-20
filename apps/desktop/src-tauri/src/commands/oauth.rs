@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use log::{error, info, warn};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -134,17 +135,17 @@ fn wait_for_callback(server: &tiny_http::Server) -> Result<(String, String), Str
     let timeout = std::time::Duration::from_secs(300);
     let start = std::time::Instant::now();
 
-    println!("等待 OAuth 回调...");
+    info!("等待 OAuth 回调...");
 
     loop {
         if start.elapsed() > timeout {
-            println!("OAuth 授权超时");
+            warn!("OAuth 授权超时");
             return Err("OAuth 授权超时".to_string());
         }
 
         match server.recv_timeout(std::time::Duration::from_millis(500)) {
             Ok(Some(request)) => {
-                println!("收到回调请求: {}", request.url());
+                info!("收到回调请求: {}", request.url());
                 let url = request.url().to_string();
 
                 // 解析查询参数
@@ -451,7 +452,7 @@ fn wait_for_callback(server: &tiny_http::Server) -> Result<(String, String), Str
                 );
 
                 if let Err(e) = request.respond(response) {
-                    println!("发送响应失败: {}", e);
+                    error!("发送响应失败: {}", e);
                 }
 
                 // 检查是否有错误
@@ -460,7 +461,7 @@ fn wait_for_callback(server: &tiny_http::Server) -> Result<(String, String), Str
                         .get("error_description")
                         .cloned()
                         .unwrap_or_else(|| "未知错误".to_string());
-                    println!("OAuth 错误: {} - {}", error, error_desc);
+                    error!("OAuth 错误: {} - {}", error, error_desc);
                     return Err(format!("OAuth 错误: {} - {}", error, error_desc));
                 }
 
@@ -468,14 +469,14 @@ fn wait_for_callback(server: &tiny_http::Server) -> Result<(String, String), Str
                 let code = params.get("code").ok_or("未收到授权码")?.clone();
                 let state = params.get("state").ok_or("未收到 state 参数")?.clone();
 
-                println!("成功获取授权码和 state");
+                info!("成功获取授权码和 state");
                 return Ok((code, state));
             }
             Ok(None) => {
                 // 超时，继续循环
             }
             Err(e) => {
-                println!("接收请求时出错: {}", e);
+                error!("接收请求时出错: {}", e);
                 // 继续循环，不中断
             }
         }
@@ -487,18 +488,18 @@ fn wait_for_callback(server: &tiny_http::Server) -> Result<(String, String), Str
 pub async fn complete_google_oauth(
     _oauth_state: State<'_, OAuthState>,
 ) -> Result<OAuthTokens, String> {
-    println!("开始 Google OAuth 授权流程");
+    info!("开始 Google OAuth 授权流程");
 
     // 启动本地回调服务器
     let (server, port) = start_callback_server()?;
     let redirect_uri = format!("http://127.0.0.1:{}", port);
-    println!("本地回调服务器已启动，端口: {}", port);
+    info!("本地回调服务器已启动，端口: {}", port);
 
     // 生成 PKCE 和 state
     let code_verifier = generate_code_verifier();
     let code_challenge = generate_code_challenge(&code_verifier);
     let state = generate_random_string(32);
-    println!("PKCE 参数已生成");
+    info!("PKCE 参数已生成");
 
     // 构建授权 URL
     let auth_url = format!(
@@ -510,33 +511,40 @@ pub async fn complete_google_oauth(
         urlencoding::encode(&code_challenge),
         urlencoding::encode(&state)
     );
-    println!("授权 URL: {}", auth_url);
+    info!("授权 URL: {}", auth_url);
 
     // 打开浏览器
-    println!("正在打开浏览器...");
-    open::that(&auth_url).map_err(|e| format!("无法打开浏览器: {}", e))?;
+    info!("正在打开浏览器...");
+    open::that(&auth_url).map_err(|e| {
+        error!("无法打开浏览器: {}", e);
+        format!("无法打开浏览器: {}", e)
+    })?;
 
     // 在阻塞线程池中等待回调（避免阻塞 async runtime）
-    println!("等待用户授权...");
-    println!("回调 URL: {}", redirect_uri);
+    info!("等待用户授权...");
+    info!("回调 URL: {}", redirect_uri);
     let (code, received_state) = tokio::task::spawn_blocking(move || {
-        println!("回调服务器正在监听...");
+        info!("回调服务器正在监听...");
         let result = wait_for_callback(&server);
-        println!("回调服务器收到响应: {:?}", result.is_ok());
+        info!("回调服务器收到响应: {:?}", result.is_ok());
         result
     })
     .await
-    .map_err(|e| format!("等待回调失败: {}", e))??;
+    .map_err(|e| {
+        error!("等待回调失败: {}", e);
+        format!("等待回调失败: {}", e)
+    })??;
 
-    println!("收到授权码，验证 state...");
+    info!("收到授权码，验证 state...");
 
     // 验证 state
     if received_state != state {
+        error!("Google OAuth State 验证失败，可能存在 CSRF 攻击");
         return Err("State 验证失败，可能存在 CSRF 攻击".to_string());
     }
 
     // 交换授权码获取 token
-    println!("开始交换授权码获取 token...");
+    info!("开始交换授权码获取 token...");
     let client = reqwest::Client::new();
     let token_response = client
         .post(GOOGLE_TOKEN_URL)
@@ -551,32 +559,32 @@ pub async fn complete_google_oauth(
         .send()
         .await
         .map_err(|e| {
-            println!("Token 请求发送失败: {}", e);
+            error!("Token 请求发送失败: {}", e);
             format!("Token 请求失败: {}", e)
         })?;
 
     let status = token_response.status();
-    println!("Token 响应状态码: {}", status);
+    info!("Token 响应状态码: {}", status);
 
     if !status.is_success() {
         let error_text = token_response.text().await.unwrap_or_default();
-        println!("Token 请求失败，响应内容: {}", error_text);
+        error!("Token 请求失败，响应内容: {}", error_text);
         return Err(format!("Token 请求失败 ({}): {}", status, error_text));
     }
 
     let response_text = token_response.text().await.map_err(|e| {
-        println!("读取 token 响应失败: {}", e);
+        error!("读取 token 响应失败: {}", e);
         format!("读取 token 响应失败: {}", e)
     })?;
 
-    println!("Token 响应内容: {}", response_text);
+    info!("Token 响应内容: {}", response_text);
 
     let tokens: OAuthTokens = serde_json::from_str(&response_text).map_err(|e| {
-        println!("解析 token 响应失败: {}", e);
+        error!("解析 token 响应失败: {}", e);
         format!("解析 token 响应失败: {}", e)
     })?;
 
-    println!("成功获取 token！");
+    info!("成功获取 token！");
     Ok(tokens)
 }
 
@@ -587,7 +595,10 @@ pub async fn refresh_google_token(refresh_token: String) -> Result<OAuthTokens, 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+        .map_err(|e| {
+            error!("创建 HTTP 客户端失败: {}", e);
+            format!("创建 HTTP 客户端失败: {}", e)
+        })?;
 
     // 重试机制：最多重试3次
     let max_retries = 3;
@@ -672,7 +683,10 @@ pub async fn revoke_google_token(token: String) -> Result<(), String> {
         .form(&[("token", token.as_str())])
         .send()
         .await
-        .map_err(|e| format!("撤销 token 失败: {}", e))?;
+        .map_err(|e| {
+            error!("撤销 token 失败: {}", e);
+            format!("撤销 token 失败: {}", e)
+        })?;
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
@@ -691,17 +705,20 @@ pub async fn get_google_user_info(access_token: String) -> Result<serde_json::Va
         .bearer_auth(&access_token)
         .send()
         .await
-        .map_err(|e| format!("获取用户信息失败: {}", e))?;
+        .map_err(|e| {
+            error!("获取用户信息失败: {}", e);
+            format!("获取用户信息失败: {}", e)
+        })?;
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
         return Err(format!("获取用户信息失败: {}", error_text));
     }
 
-    let user_info: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("解析用户信息失败: {}", e))?;
+    let user_info: serde_json::Value = response.json().await.map_err(|e| {
+        error!("解析用户信息失败: {}", e);
+        format!("解析用户信息失败: {}", e)
+    })?;
 
     Ok(user_info)
 }
@@ -715,17 +732,20 @@ pub async fn get_google_drive_quota(access_token: String) -> Result<serde_json::
         .bearer_auth(&access_token)
         .send()
         .await
-        .map_err(|e| format!("获取存储配额失败: {}", e))?;
+        .map_err(|e| {
+            error!("获取存储配额失败: {}", e);
+            format!("获取存储配额失败: {}", e)
+        })?;
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
         return Err(format!("获取存储配额失败: {}", error_text));
     }
 
-    let quota_info: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("解析存储配额失败: {}", e))?;
+    let quota_info: serde_json::Value = response.json().await.map_err(|e| {
+        error!("解析存储配额失败: {}", e);
+        format!("解析存储配额失败: {}", e)
+    })?;
 
     Ok(quota_info)
 }
@@ -738,16 +758,16 @@ pub async fn get_google_drive_quota(access_token: String) -> Result<serde_json::
 pub async fn complete_baidu_oauth(
     _oauth_state: State<'_, OAuthState>,
 ) -> Result<OAuthTokens, String> {
-    println!("开始百度网盘 OAuth 授权流程");
+    info!("开始百度网盘 OAuth 授权流程");
 
     // 启动本地回调服务器
     let (server, port) = start_callback_server()?;
     let redirect_uri = format!("http://127.0.0.1:{}", port);
-    println!("本地回调服务器已启动，端口: {}", port);
+    info!("本地回调服务器已启动，端口: {}", port);
 
     // 生成 state（用于 CSRF 防护）
     let state = generate_random_string(32);
-    println!("State 参数已生成");
+    info!("State 参数已生成");
 
     // 构建授权 URL（百度网盘不支持 PKCE）
     let auth_url = format!(
@@ -758,33 +778,40 @@ pub async fn complete_baidu_oauth(
         urlencoding::encode(BAIDU_SCOPES),
         urlencoding::encode(&state)
     );
-    println!("授权 URL: {}", auth_url);
+    info!("授权 URL: {}", auth_url);
 
     // 打开浏览器
-    println!("正在打开浏览器...");
-    open::that(&auth_url).map_err(|e| format!("无法打开浏览器: {}", e))?;
+    info!("正在打开浏览器...");
+    open::that(&auth_url).map_err(|e| {
+        error!("无法打开浏览器: {}", e);
+        format!("无法打开浏览器: {}", e)
+    })?;
 
     // 在阻塞线程池中等待回调（避免阻塞 async runtime）
-    println!("等待用户授权...");
-    println!("回调 URL: {}", redirect_uri);
+    info!("等待用户授权...");
+    info!("回调 URL: {}", redirect_uri);
     let (code, received_state) = tokio::task::spawn_blocking(move || {
-        println!("回调服务器正在监听...");
+        info!("回调服务器正在监听...");
         let result = wait_for_callback(&server);
-        println!("回调服务器收到响应: {:?}", result.is_ok());
+        info!("回调服务器收到响应: {:?}", result.is_ok());
         result
     })
     .await
-    .map_err(|e| format!("等待回调失败: {}", e))??;
+    .map_err(|e| {
+        error!("等待回调失败: {}", e);
+        format!("等待回调失败: {}", e)
+    })??;
 
-    println!("收到授权码，验证 state...");
+    info!("收到授权码，验证 state...");
 
     // 验证 state
     if received_state != state {
+        error!("Baidu OAuth State 验证失败，可能存在 CSRF 攻击");
         return Err("State 验证失败，可能存在 CSRF 攻击".to_string());
     }
 
     // 交换授权码获取 token（百度网盘使用 GET 请求）
-    println!("开始交换授权码获取 token...");
+    info!("开始交换授权码获取 token...");
     let client = reqwest::Client::new();
     let token_url = format!(
         "{}?grant_type=authorization_code&code={}&client_id={}&client_secret={}&redirect_uri={}",
@@ -796,33 +823,33 @@ pub async fn complete_baidu_oauth(
     );
 
     let token_response = client.get(&token_url).send().await.map_err(|e| {
-        println!("Token 请求发送失败: {}", e);
+        error!("Token 请求发送失败: {}", e);
         format!("Token 请求失败: {}", e)
     })?;
 
     let status = token_response.status();
-    println!("Token 响应状态码: {}", status);
+    info!("Token 响应状态码: {}", status);
 
     if !status.is_success() {
         let error_text = token_response.text().await.unwrap_or_default();
-        println!("Token 请求失败，响应内容: {}", error_text);
+        error!("Token 请求失败，响应内容: {}", error_text);
         return Err(format!("Token 请求失败 ({}): {}", status, error_text));
     }
 
     let response_text = token_response.text().await.map_err(|e| {
-        println!("读取 token 响应失败: {}", e);
+        error!("读取 token 响应失败: {}", e);
         format!("读取 token 响应失败: {}", e)
     })?;
 
-    println!("Token 响应内容: {}", response_text);
+    info!("Token 响应内容: {}", response_text);
 
     // 百度网盘返回的 token 格式可能不同，需要适配
     let tokens: OAuthTokens = serde_json::from_str(&response_text).map_err(|e| {
-        println!("解析 token 响应失败: {}", e);
+        error!("解析 token 响应失败: {}", e);
         format!("解析 token 响应失败: {}", e)
     })?;
 
-    println!("成功获取 token！");
+    info!("成功获取 token！");
     Ok(tokens)
 }
 
@@ -838,21 +865,20 @@ pub async fn refresh_baidu_token(refresh_token: String) -> Result<OAuthTokens, S
         urlencoding::encode(BAIDU_CLIENT_SECRET)
     );
 
-    let token_response = client
-        .get(&token_url)
-        .send()
-        .await
-        .map_err(|e| format!("刷新 token 失败: {}", e))?;
+    let token_response = client.get(&token_url).send().await.map_err(|e| {
+        error!("刷新 token 失败: {}", e);
+        format!("刷新 token 失败: {}", e)
+    })?;
 
     if !token_response.status().is_success() {
         let error_text = token_response.text().await.unwrap_or_default();
         return Err(format!("刷新 token 失败: {}", error_text));
     }
 
-    let tokens: OAuthTokens = token_response
-        .json()
-        .await
-        .map_err(|e| format!("解析 token 响应失败: {}", e))?;
+    let tokens: OAuthTokens = token_response.json().await.map_err(|e| {
+        error!("解析 token 响应失败: {}", e);
+        format!("解析 token 响应失败: {}", e)
+    })?;
 
     Ok(tokens)
 }
@@ -863,7 +889,7 @@ pub async fn refresh_baidu_token(refresh_token: String) -> Result<OAuthTokens, S
 pub async fn revoke_baidu_token(_token: String) -> Result<(), String> {
     // 百度网盘可能不支持 token 撤销，或者需要调用特定的 API
     // 这里先返回成功，实际使用时可能需要根据百度网盘的文档调整
-    println!("百度网盘 token 撤销（如果支持）");
+    info!("百度网盘 token 撤销（如果支持）");
     Ok(())
 }
 
@@ -876,21 +902,20 @@ pub async fn get_baidu_user_info(access_token: String) -> Result<serde_json::Val
         urlencoding::encode(&access_token)
     );
 
-    let response = client
-        .get(&user_info_url)
-        .send()
-        .await
-        .map_err(|e| format!("获取用户信息失败: {}", e))?;
+    let response = client.get(&user_info_url).send().await.map_err(|e| {
+        error!("获取用户信息失败: {}", e);
+        format!("获取用户信息失败: {}", e)
+    })?;
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
         return Err(format!("获取用户信息失败: {}", error_text));
     }
 
-    let user_info: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("解析用户信息失败: {}", e))?;
+    let user_info: serde_json::Value = response.json().await.map_err(|e| {
+        error!("解析用户信息失败: {}", e);
+        format!("解析用户信息失败: {}", e)
+    })?;
 
     Ok(user_info)
 }
@@ -905,21 +930,20 @@ pub async fn get_baidu_netdisk_quota(access_token: String) -> Result<serde_json:
         urlencoding::encode(&access_token)
     );
 
-    let response = client
-        .get(&quota_url)
-        .send()
-        .await
-        .map_err(|e| format!("获取存储配额失败: {}", e))?;
+    let response = client.get(&quota_url).send().await.map_err(|e| {
+        error!("获取存储配额失败: {}", e);
+        format!("获取存储配额失败: {}", e)
+    })?;
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
         return Err(format!("获取存储配额失败: {}", error_text));
     }
 
-    let quota_info: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("解析存储配额失败: {}", e))?;
+    let quota_info: serde_json::Value = response.json().await.map_err(|e| {
+        error!("解析存储配额失败: {}", e);
+        format!("解析存储配额失败: {}", e)
+    })?;
 
     Ok(quota_info)
 }
@@ -932,18 +956,18 @@ pub async fn get_baidu_netdisk_quota(access_token: String) -> Result<serde_json:
 pub async fn complete_aliyun_oauth(
     _oauth_state: State<'_, OAuthState>,
 ) -> Result<OAuthTokens, String> {
-    println!("开始阿里云盘 OAuth 授权流程");
+    info!("开始阿里云盘 OAuth 授权流程");
 
     // 启动本地回调服务器
     let (server, port) = start_callback_server()?;
     let redirect_uri = format!("http://127.0.0.1:{}", port);
-    println!("本地回调服务器已启动，端口: {}", port);
+    info!("本地回调服务器已启动，端口: {}", port);
 
     // 生成 PKCE 和 state
     let code_verifier = generate_code_verifier();
     let code_challenge = generate_code_challenge(&code_verifier);
     let state = generate_random_string(32);
-    println!("PKCE 参数已生成");
+    info!("PKCE 参数已生成");
 
     // 构建授权 URL（阿里云盘支持 PKCE）
     let auth_url = format!(
@@ -955,33 +979,40 @@ pub async fn complete_aliyun_oauth(
         urlencoding::encode(&code_challenge),
         urlencoding::encode(&state)
     );
-    println!("授权 URL: {}", auth_url);
+    info!("授权 URL: {}", auth_url);
 
     // 打开浏览器
-    println!("正在打开浏览器...");
-    open::that(&auth_url).map_err(|e| format!("无法打开浏览器: {}", e))?;
+    info!("正在打开浏览器...");
+    open::that(&auth_url).map_err(|e| {
+        error!("无法打开浏览器: {}", e);
+        format!("无法打开浏览器: {}", e)
+    })?;
 
     // 在阻塞线程池中等待回调（避免阻塞 async runtime）
-    println!("等待用户授权...");
-    println!("回调 URL: {}", redirect_uri);
+    info!("等待用户授权...");
+    info!("回调 URL: {}", redirect_uri);
     let (code, received_state) = tokio::task::spawn_blocking(move || {
-        println!("回调服务器正在监听...");
+        info!("回调服务器正在监听...");
         let result = wait_for_callback(&server);
-        println!("回调服务器收到响应: {:?}", result.is_ok());
+        info!("回调服务器收到响应: {:?}", result.is_ok());
         result
     })
     .await
-    .map_err(|e| format!("等待回调失败: {}", e))??;
+    .map_err(|e| {
+        error!("等待回调失败: {}", e);
+        format!("等待回调失败: {}", e)
+    })??;
 
-    println!("收到授权码，验证 state...");
+    info!("收到授权码，验证 state...");
 
     // 验证 state
     if received_state != state {
+        error!("Aliyun OAuth State 验证失败，可能存在 CSRF 攻击");
         return Err("State 验证失败，可能存在 CSRF 攻击".to_string());
     }
 
     // 交换授权码获取 token（阿里云盘使用 POST 请求，支持 PKCE）
-    println!("开始交换授权码获取 token...");
+    info!("开始交换授权码获取 token...");
     let client = reqwest::Client::new();
     let token_response = client
         .post(ALIYUN_TOKEN_URL)
@@ -996,32 +1027,32 @@ pub async fn complete_aliyun_oauth(
         .send()
         .await
         .map_err(|e| {
-            println!("Token 请求发送失败: {}", e);
+            error!("Token 请求发送失败: {}", e);
             format!("Token 请求失败: {}", e)
         })?;
 
     let status = token_response.status();
-    println!("Token 响应状态码: {}", status);
+    info!("Token 响应状态码: {}", status);
 
     if !status.is_success() {
         let error_text = token_response.text().await.unwrap_or_default();
-        println!("Token 请求失败，响应内容: {}", error_text);
+        error!("Token 请求失败，响应内容: {}", error_text);
         return Err(format!("Token 请求失败 ({}): {}", status, error_text));
     }
 
     let response_text = token_response.text().await.map_err(|e| {
-        println!("读取 token 响应失败: {}", e);
+        error!("读取 token 响应失败: {}", e);
         format!("读取 token 响应失败: {}", e)
     })?;
 
-    println!("Token 响应内容: {}", response_text);
+    info!("Token 响应内容: {}", response_text);
 
     let tokens: OAuthTokens = serde_json::from_str(&response_text).map_err(|e| {
-        println!("解析 token 响应失败: {}", e);
+        error!("解析 token 响应失败: {}", e);
         format!("解析 token 响应失败: {}", e)
     })?;
 
-    println!("成功获取 token！");
+    info!("成功获取 token！");
     Ok(tokens)
 }
 
@@ -1039,17 +1070,20 @@ pub async fn refresh_aliyun_token(refresh_token: String) -> Result<OAuthTokens, 
         ])
         .send()
         .await
-        .map_err(|e| format!("刷新 token 失败: {}", e))?;
+        .map_err(|e| {
+            error!("刷新 token 失败: {}", e);
+            format!("刷新 token 失败: {}", e)
+        })?;
 
     if !token_response.status().is_success() {
         let error_text = token_response.text().await.unwrap_or_default();
         return Err(format!("刷新 token 失败: {}", error_text));
     }
 
-    let tokens: OAuthTokens = token_response
-        .json()
-        .await
-        .map_err(|e| format!("解析 token 响应失败: {}", e))?;
+    let tokens: OAuthTokens = token_response.json().await.map_err(|e| {
+        error!("解析 token 响应失败: {}", e);
+        format!("解析 token 响应失败: {}", e)
+    })?;
 
     Ok(tokens)
 }
@@ -1058,7 +1092,7 @@ pub async fn refresh_aliyun_token(refresh_token: String) -> Result<OAuthTokens, 
 #[tauri::command]
 pub async fn revoke_aliyun_token(_token: String) -> Result<(), String> {
     // 阿里云盘可能没有标准的撤销端点，这里提供一个占位实现
-    println!("阿里云盘 token 撤销（如果支持）");
+    info!("阿里云盘 token 撤销（如果支持）");
     Ok(())
 }
 
@@ -1073,17 +1107,20 @@ pub async fn get_aliyun_user_info(access_token: String) -> Result<serde_json::Va
         .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await
-        .map_err(|e| format!("获取用户信息失败: {}", e))?;
+        .map_err(|e| {
+            error!("获取用户信息失败: {}", e);
+            format!("获取用户信息失败: {}", e)
+        })?;
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
         return Err(format!("获取用户信息失败: {}", error_text));
     }
 
-    let user_info: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("解析用户信息失败: {}", e))?;
+    let user_info: serde_json::Value = response.json().await.map_err(|e| {
+        error!("解析用户信息失败: {}", e);
+        format!("解析用户信息失败: {}", e)
+    })?;
 
     Ok(user_info)
 }
@@ -1100,17 +1137,20 @@ pub async fn get_aliyun_drive_quota(access_token: String) -> Result<serde_json::
         .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await
-        .map_err(|e| format!("获取存储配额失败: {}", e))?;
+        .map_err(|e| {
+            error!("获取存储配额失败: {}", e);
+            format!("获取存储配额失败: {}", e)
+        })?;
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
         return Err(format!("获取存储配额失败: {}", error_text));
     }
 
-    let quota_info: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("解析存储配额失败: {}", e))?;
+    let quota_info: serde_json::Value = response.json().await.map_err(|e| {
+        error!("解析存储配额失败: {}", e);
+        format!("解析存储配额失败: {}", e)
+    })?;
 
     Ok(quota_info)
 }
@@ -1123,18 +1163,18 @@ pub async fn get_aliyun_drive_quota(access_token: String) -> Result<serde_json::
 pub async fn complete_dropbox_oauth(
     _oauth_state: State<'_, OAuthState>,
 ) -> Result<OAuthTokens, String> {
-    println!("开始 Dropbox OAuth 授权流程");
+    info!("开始 Dropbox OAuth 授权流程");
 
     // 启动本地回调服务器
     let (server, port) = start_callback_server()?;
     let redirect_uri = format!("http://127.0.0.1:{}", port);
-    println!("本地回调服务器已启动，端口: {}", port);
+    info!("本地回调服务器已启动，端口: {}", port);
 
     // 生成 PKCE 和 state
     let code_verifier = generate_code_verifier();
     let code_challenge = generate_code_challenge(&code_verifier);
     let state = generate_random_string(32);
-    println!("PKCE 参数已生成");
+    info!("PKCE 参数已生成");
 
     // 构建授权 URL（Dropbox 支持 PKCE）
     let auth_url = format!(
@@ -1146,33 +1186,40 @@ pub async fn complete_dropbox_oauth(
         urlencoding::encode(&code_challenge),
         urlencoding::encode(&state)
     );
-    println!("授权 URL: {}", auth_url);
+    info!("授权 URL: {}", auth_url);
 
     // 打开浏览器
-    println!("正在打开浏览器...");
-    open::that(&auth_url).map_err(|e| format!("无法打开浏览器: {}", e))?;
+    info!("正在打开浏览器...");
+    open::that(&auth_url).map_err(|e| {
+        error!("无法打开浏览器: {}", e);
+        format!("无法打开浏览器: {}", e)
+    })?;
 
     // 在阻塞线程池中等待回调（避免阻塞 async runtime）
-    println!("等待用户授权...");
-    println!("回调 URL: {}", redirect_uri);
+    info!("等待用户授权...");
+    info!("回调 URL: {}", redirect_uri);
     let (code, received_state) = tokio::task::spawn_blocking(move || {
-        println!("回调服务器正在监听...");
+        info!("回调服务器正在监听...");
         let result = wait_for_callback(&server);
-        println!("回调服务器收到响应: {:?}", result.is_ok());
+        info!("回调服务器收到响应: {:?}", result.is_ok());
         result
     })
     .await
-    .map_err(|e| format!("等待回调失败: {}", e))??;
+    .map_err(|e| {
+        error!("等待回调失败: {}", e);
+        format!("等待回调失败: {}", e)
+    })??;
 
-    println!("收到授权码，验证 state...");
+    info!("收到授权码，验证 state...");
 
     // 验证 state
     if received_state != state {
+        error!("Dropbox OAuth State 验证失败，可能存在 CSRF 攻击");
         return Err("State 验证失败，可能存在 CSRF 攻击".to_string());
     }
 
     // 交换授权码获取 token（Dropbox 使用 Basic Auth，支持 PKCE）
-    println!("开始交换授权码获取 token...");
+    info!("开始交换授权码获取 token...");
     let client = reqwest::Client::new();
     let token_response = client
         .post(DROPBOX_TOKEN_URL)
@@ -1186,32 +1233,32 @@ pub async fn complete_dropbox_oauth(
         .send()
         .await
         .map_err(|e| {
-            println!("Token 请求发送失败: {}", e);
+            error!("Token 请求发送失败: {}", e);
             format!("Token 请求失败: {}", e)
         })?;
 
     let status = token_response.status();
-    println!("Token 响应状态码: {}", status);
+    info!("Token 响应状态码: {}", status);
 
     if !status.is_success() {
         let error_text = token_response.text().await.unwrap_or_default();
-        println!("Token 请求失败，响应内容: {}", error_text);
+        error!("Token 请求失败，响应内容: {}", error_text);
         return Err(format!("Token 请求失败 ({}): {}", status, error_text));
     }
 
     let response_text = token_response.text().await.map_err(|e| {
-        println!("读取 token 响应失败: {}", e);
+        error!("读取 token 响应失败: {}", e);
         format!("读取 token 响应失败: {}", e)
     })?;
 
-    println!("Token 响应内容: {}", response_text);
+    info!("Token 响应内容: {}", response_text);
 
     let tokens: OAuthTokens = serde_json::from_str(&response_text).map_err(|e| {
-        println!("解析 token 响应失败: {}", e);
+        error!("解析 token 响应失败: {}", e);
         format!("解析 token 响应失败: {}", e)
     })?;
 
-    println!("成功获取 token！");
+    info!("成功获取 token！");
     Ok(tokens)
 }
 
@@ -1229,17 +1276,20 @@ pub async fn refresh_dropbox_token(refresh_token: String) -> Result<OAuthTokens,
         ])
         .send()
         .await
-        .map_err(|e| format!("刷新 token 失败: {}", e))?;
+        .map_err(|e| {
+            error!("刷新 token 失败: {}", e);
+            format!("刷新 token 失败: {}", e)
+        })?;
 
     if !token_response.status().is_success() {
         let error_text = token_response.text().await.unwrap_or_default();
         return Err(format!("刷新 token 失败: {}", error_text));
     }
 
-    let tokens: OAuthTokens = token_response
-        .json()
-        .await
-        .map_err(|e| format!("解析 token 响应失败: {}", e))?;
+    let tokens: OAuthTokens = token_response.json().await.map_err(|e| {
+        error!("解析 token 响应失败: {}", e);
+        format!("解析 token 响应失败: {}", e)
+    })?;
 
     Ok(tokens)
 }
@@ -1253,7 +1303,10 @@ pub async fn revoke_dropbox_token(token: String) -> Result<(), String> {
         .bearer_auth(&token)
         .send()
         .await
-        .map_err(|e| format!("撤销 token 失败: {}", e))?;
+        .map_err(|e| {
+            error!("撤销 token 失败: {}", e);
+            format!("撤销 token 失败: {}", e)
+        })?;
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
@@ -1272,17 +1325,20 @@ pub async fn get_dropbox_user_info(access_token: String) -> Result<serde_json::V
         .bearer_auth(&access_token)
         .send()
         .await
-        .map_err(|e| format!("获取用户信息失败: {}", e))?;
+        .map_err(|e| {
+            error!("获取用户信息失败: {}", e);
+            format!("获取用户信息失败: {}", e)
+        })?;
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
         return Err(format!("获取用户信息失败: {}", error_text));
     }
 
-    let user_info: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("解析用户信息失败: {}", e))?;
+    let user_info: serde_json::Value = response.json().await.map_err(|e| {
+        error!("解析用户信息失败: {}", e);
+        format!("解析用户信息失败: {}", e)
+    })?;
 
     Ok(user_info)
 }
@@ -1296,17 +1352,20 @@ pub async fn get_dropbox_quota(access_token: String) -> Result<serde_json::Value
         .bearer_auth(&access_token)
         .send()
         .await
-        .map_err(|e| format!("获取存储配额失败: {}", e))?;
+        .map_err(|e| {
+            error!("获取存储配额失败: {}", e);
+            format!("获取存储配额失败: {}", e)
+        })?;
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
         return Err(format!("获取存储配额失败: {}", error_text));
     }
 
-    let quota_info: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("解析存储配额失败: {}", e))?;
+    let quota_info: serde_json::Value = response.json().await.map_err(|e| {
+        error!("解析存储配额失败: {}", e);
+        format!("解析存储配额失败: {}", e)
+    })?;
 
     Ok(quota_info)
 }

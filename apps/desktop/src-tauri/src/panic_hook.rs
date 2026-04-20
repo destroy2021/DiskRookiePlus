@@ -9,11 +9,9 @@ pub fn install_broken_pipe_safe_panic_hook() {
 }
 
 fn panic_hook_impl(info: &PanicHookInfo<'_>) {
-    let _ = writeln!(
-        std::io::stderr(),
-        "thread panicked: {}",
-        info_to_string(info)
-    );
+    let msg = info_to_string(info);
+    log::error!("panic: {}", msg);
+    let _ = writeln!(std::io::stderr(), "thread panicked: {}", msg);
 }
 
 fn info_to_string(info: &PanicHookInfo<'_>) -> String {

@@ -27,6 +27,10 @@ export interface AnalysisResult {
   summary: string
   promptText?: string
   rawText?: string
+  interrupted?: boolean
+  partial?: boolean
+  droppedSuggestions?: number
+  continueContextHint?: string
   tokenUsage?: {
     prompt_tokens: number
     completion_tokens: number
@@ -120,15 +124,20 @@ const tools: FunctionTool[] = [
 // 执行 AI 分析
 export async function analyzeWithAI(
   diskSummary: string,
-  onProgress?: (msg: string) => void
+  onProgress?: (msg: string) => void,
+  signal?: AbortSignal,
 ): Promise<AnalysisResult> {
+  ensureNotAborted(signal)
+
   const settings = await loadSettings()
+  ensureNotAborted(signal)
   const apiKey = await resolveEffectiveApiKey(settings)
   if (!apiKey) {
     throw new Error('请先在设置中配置 API Key，或完成 Kimi Code 登录')
   }
 
   const systemInfo = await getSystemInfo()
+  ensureNotAborted(signal)
   
   // 获取当前语言
   const currentLanguage = i18n.language || 'zh'
@@ -245,10 +254,12 @@ Please carefully analyze the data and provide reasonable, safe suggestions. All 
     }
   ]
   const promptText = messages.map((m) => `[${m.role}]\n${m.content}`).join('\n\n')
+  let rawTextForRecovery = ''
 
   onProgress?.(i18n.t('aiAnalysis.calling'))
 
   try {
+    ensureNotAborted(signal)
     const url = `${settings.apiUrl.replace(/\/$/, '')}/chat/completions`
     
     const headers: Record<string, string> = {
@@ -267,6 +278,7 @@ Please carefully analyze the data and provide reasonable, safe suggestions. All 
     const response = await httpFetch(url, {
       method: 'POST',
       headers,
+      signal,
       body: JSON.stringify({
         model: settings.model,
         messages,
@@ -277,7 +289,10 @@ Please carefully analyze the data and provide reasonable, safe suggestions. All 
       }),
     })
 
+    ensureNotAborted(signal)
     const rawText = await response.text()
+    rawTextForRecovery = rawText
+    ensureNotAborted(signal)
     if (!response.ok) {
       throw new Error(`AI 请求失败: ${response.status} - ${rawText}`)
     }
@@ -300,21 +315,14 @@ Please carefully analyze the data and provide reasonable, safe suggestions. All 
       
       if (toolCall.function.name === 'output_suggestions') {
         onProgress?.(i18n.t('aiAnalysis.parsing'))
-        
-        try {
-          const args = JSON.parse(toolCall.function.arguments)
-          const suggestions: CleanupSuggestion[] = args.suggestions || []
-          
-          return {
-            suggestions,
-            summary: i18n.t('aiAnalysis.foundSuggestions', { count: suggestions.length }),
-            promptText,
-            rawText,
-            tokenUsage: data.usage
-          }
-        } catch (parseError) {
-          throw new Error('解析 AI 响应失败: ' + String(parseError))
-        }
+
+        const parsed = parseSuggestionsFromArguments(toolCall.function.arguments)
+        return buildToolCallResult(parsed, {
+          promptText,
+          rawText,
+          tokenUsage: data.usage,
+          interrupted: false,
+        })
       }
     }
 
@@ -328,8 +336,255 @@ Please carefully analyze the data and provide reasonable, safe suggestions. All 
       tokenUsage: data.usage
     }
   } catch (error) {
-    console.error('AI 分析失败:', error)
+    if (isAbortAnalysisError(error)) {
+      const recovered = tryBuildInterruptedResultFromRaw(rawTextForRecovery, promptText)
+      if (recovered) {
+        console.info('AI 分析已中断，已保留可验证的部分结果')
+        return recovered
+      }
+      console.info('AI 分析已中断')
+    } else {
+      console.error('AI 分析失败:', error)
+    }
     throw error
+  }
+}
+
+function ensureNotAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw createAbortError()
+  }
+}
+
+function createAbortError(): Error {
+  try {
+    return new DOMException('AI analysis interrupted', 'AbortError')
+  } catch {
+    const error = new Error('AI analysis interrupted')
+    ;(error as Error & { name: string }).name = 'AbortError'
+    return error
+  }
+}
+
+function isAbortAnalysisError(error: unknown): boolean {
+  if (!error) return false
+  if (error instanceof DOMException && error.name === 'AbortError') return true
+  if (error instanceof Error && error.name === 'AbortError') return true
+  return String(error).toLowerCase().includes('abort')
+}
+
+interface ParsedSuggestions {
+  suggestions: CleanupSuggestion[]
+  droppedSuggestions: number
+  partial: boolean
+}
+
+function buildToolCallResult(
+  parsed: ParsedSuggestions,
+  context: {
+    promptText: string
+    rawText: string
+    tokenUsage?: AnalysisResult['tokenUsage']
+    interrupted: boolean
+  },
+): AnalysisResult {
+  let summary = parsed.suggestions.length > 0
+    ? i18n.t('aiAnalysis.foundSuggestions', { count: parsed.suggestions.length })
+    : i18n.t('aiAnalysis.noSuggestions')
+
+  if (context.interrupted) {
+    summary = i18n.t('aiAnalysis.canceledWithPartial', { count: parsed.suggestions.length })
+  }
+
+  return {
+    suggestions: parsed.suggestions,
+    summary,
+    promptText: context.promptText,
+    rawText: context.rawText,
+    tokenUsage: context.tokenUsage,
+    interrupted: context.interrupted || undefined,
+    partial: parsed.partial || undefined,
+    droppedSuggestions: parsed.droppedSuggestions > 0 ? parsed.droppedSuggestions : undefined,
+    continueContextHint: context.interrupted ? i18n.t('aiAnalysis.continueFromContextHint') : undefined,
+  }
+}
+
+function parseSuggestionsFromArguments(argumentsText: string): ParsedSuggestions {
+  try {
+    const parsed = JSON.parse(argumentsText) as { suggestions?: unknown[] }
+    if (!Array.isArray(parsed?.suggestions)) {
+      return { suggestions: [], droppedSuggestions: 0, partial: true }
+    }
+    return validateSuggestionCandidates(parsed.suggestions, false)
+  } catch {
+    const objectSlices = extractBalancedJsonObjectSlices(argumentsText)
+    const candidates: unknown[] = []
+    for (const slice of objectSlices) {
+      try {
+        candidates.push(JSON.parse(slice))
+      } catch {
+        // ignore broken candidate
+      }
+    }
+    return validateSuggestionCandidates(candidates, true)
+  }
+}
+
+function validateSuggestionCandidates(candidates: unknown[], partial: boolean): ParsedSuggestions {
+  const suggestions: CleanupSuggestion[] = []
+  const dedupe = new Set<string>()
+  let dropped = 0
+
+  for (const candidate of candidates) {
+    const normalized = normalizeSuggestion(candidate)
+    if (!normalized) {
+      dropped += 1
+      continue
+    }
+    const key = `${normalized.action}|${normalized.type}|${normalized.path}`
+    if (dedupe.has(key)) {
+      dropped += 1
+      continue
+    }
+    dedupe.add(key)
+    suggestions.push(normalized)
+  }
+
+  return {
+    suggestions,
+    droppedSuggestions: dropped,
+    partial: partial || dropped > 0,
+  }
+}
+
+function normalizeSuggestion(candidate: unknown): CleanupSuggestion | null {
+  if (!candidate || typeof candidate !== 'object') return null
+  const record = candidate as Record<string, unknown>
+  const action = record.action === 'delete' || record.action === 'move' ? record.action : null
+  const type = record.type === 'file' || record.type === 'directory' ? record.type : null
+  const path = toNonEmptyText(record.path)
+
+  if (!action || !type || !path) {
+    return null
+  }
+
+  return {
+    action,
+    type,
+    path,
+    size: toText(record.size, '-'),
+    updateTime: toText(record.updateTime, '-'),
+    message: toText(record.message, ''),
+  }
+}
+
+function toNonEmptyText(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed ? trimmed : null
+}
+
+function toText(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback
+  const trimmed = value.trim()
+  return trimmed ? trimmed : fallback
+}
+
+function extractBalancedJsonObjectSlices(text: string): string[] {
+  const result: string[] = []
+  let depth = 0
+  let start = -1
+  let inString = false
+  let escaped = false
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (ch === '\\') {
+        escaped = true
+      } else if (ch === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+
+    if (ch === '{') {
+      if (depth === 0) start = i
+      depth += 1
+      continue
+    }
+
+    if (ch === '}') {
+      if (depth <= 0) continue
+      depth -= 1
+      if (depth === 0 && start >= 0) {
+        result.push(text.slice(start, i + 1))
+        start = -1
+      }
+    }
+  }
+
+  return result
+}
+
+function tryBuildInterruptedResultFromRaw(rawText: string, promptText: string): AnalysisResult | null {
+  const text = rawText.trim()
+  if (!text) return null
+
+  try {
+    const data = JSON.parse(text) as ChatCompletionResponse
+    const choice = data.choices?.[0]
+    if (!choice) return null
+
+    if (choice.message.tool_calls && choice.message.tool_calls.length > 0) {
+      const toolCall = choice.message.tool_calls[0]
+      if (toolCall.function.name === 'output_suggestions') {
+        const parsed = parseSuggestionsFromArguments(toolCall.function.arguments)
+        return buildToolCallResult(parsed, {
+          promptText,
+          rawText,
+          tokenUsage: data.usage,
+          interrupted: true,
+        })
+      }
+    }
+
+    const content = typeof choice.message.content === 'string' ? choice.message.content : ''
+    if (!content.trim()) return null
+    return {
+      suggestions: [],
+      summary: i18n.t('aiAnalysis.canceled'),
+      promptText,
+      rawText,
+      tokenUsage: data.usage,
+      interrupted: true,
+      partial: true,
+      continueContextHint: i18n.t('aiAnalysis.continueFromContextHint'),
+    }
+  } catch {
+    const parsed = validateSuggestionCandidates(
+      extractBalancedJsonObjectSlices(text).map((slice) => {
+        try {
+          return JSON.parse(slice)
+        } catch {
+          return null
+        }
+      }).filter((v) => v !== null),
+      true,
+    )
+    if (parsed.suggestions.length === 0) return null
+    return buildToolCallResult(parsed, {
+      promptText,
+      rawText,
+      interrupted: true,
+    })
   }
 }
 

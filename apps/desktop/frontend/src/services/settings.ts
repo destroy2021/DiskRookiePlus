@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 export interface AppSettings {
   promptFileCount: number
   useMftScan?: boolean
-  /** Snapshot save directory relative to app storage root */
+  /** Snapshot save directory relative to runtime data root (~/.disk-rookie) */
   snapshotSaveDir?: string
   /** Auto save snapshot after AI analysis */
   autoSaveAfterAi?: boolean

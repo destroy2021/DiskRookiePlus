@@ -1,6 +1,7 @@
 import type { TreemapNode } from '../components/Treemap'
 import type { AnalysisResult } from './ai-analysis'
-import { readJSON, writeJSON, deleteStorageFile } from './storage'
+import { invoke } from '@tauri-apps/api/core'
+import { readJSON, writeJSON, deleteStorageFile, getStoragePath } from './storage'
 import { loadAppSettings, normalizeSnapshotSaveDir } from './settings'
 
 interface TopFileEntry {
@@ -77,6 +78,55 @@ const SNAPSHOTS_INDEX = 'snapshots/index.json'
 const LEGACY_SNAPSHOT_DIR = 'snapshots'
 const SNAPSHOT_SCHEMA_VERSION = 3
 const SNAPSHOT_LIMIT = 50
+const BROWSER_STORAGE_PREFIX = 'browser://'
+const SNAPSHOT_TRUNCATE_SUFFIX = '\n...[snapshot truncated for size]'
+
+interface SnapshotPersistProfile {
+  maxSummaryChars: number
+  maxAiPromptChars: number
+  maxAiRawTextChars: number
+  maxSuggestions: number
+  maxSuggestionMessageChars: number
+  maxAnalysisSummaryChars: number
+  maxAnalysisPromptChars: number
+  maxAnalysisRawChars: number
+  maxTopEntries: number
+  maxTreeNodes: number
+  maxTreeDepth: number
+  maxChildrenPerDir: number
+}
+
+const SNAPSHOT_PERSIST_PROFILE_REDUCED: SnapshotPersistProfile = {
+  maxSummaryChars: 300_000,
+  maxAiPromptChars: 300_000,
+  maxAiRawTextChars: 800_000,
+  maxSuggestions: 2_000,
+  maxSuggestionMessageChars: 2_000,
+  maxAnalysisSummaryChars: 100_000,
+  maxAnalysisPromptChars: 200_000,
+  maxAnalysisRawChars: 600_000,
+  maxTopEntries: 8_000,
+  maxTreeNodes: 120_000,
+  maxTreeDepth: 18,
+  maxChildrenPerDir: 2_000,
+}
+
+const SNAPSHOT_PERSIST_PROFILE_MINIMAL: SnapshotPersistProfile = {
+  maxSummaryChars: 120_000,
+  maxAiPromptChars: 100_000,
+  maxAiRawTextChars: 200_000,
+  maxSuggestions: 500,
+  maxSuggestionMessageChars: 1_000,
+  maxAnalysisSummaryChars: 50_000,
+  maxAnalysisPromptChars: 80_000,
+  maxAnalysisRawChars: 150_000,
+  maxTopEntries: 2_000,
+  maxTreeNodes: 25_000,
+  maxTreeDepth: 12,
+  maxChildrenPerDir: 600,
+}
+
+export type OpenSnapshotDirectoryResult = 'ok' | 'not_found' | 'unsupported'
 
 async function loadSnapshotIndex(): Promise<SnapshotMetadata[]> {
   return await readJSON<SnapshotMetadata[]>(SNAPSHOTS_INDEX, [])
@@ -109,6 +159,209 @@ function normalizeSnapshot(raw: Partial<Snapshot> | null): Snapshot | null {
     ai_raw_text: typeof raw.ai_raw_text === 'string' ? raw.ai_raw_text : '',
     ai_structured_result: raw.ai_structured_result ?? null,
   }
+}
+
+function isInvalidStringLengthError(error: unknown): boolean {
+  if (error instanceof RangeError) return true
+  const text = String(error).toLowerCase()
+  return text.includes('invalid string length') || text.includes('out of memory')
+}
+
+function truncateText(input: string, maxChars: number): { value: string; truncated: boolean } {
+  if (maxChars <= 0) {
+    return { value: '', truncated: input.length > 0 }
+  }
+  if (input.length <= maxChars) {
+    return { value: input, truncated: false }
+  }
+  const keep = Math.max(0, maxChars - SNAPSHOT_TRUNCATE_SUFFIX.length)
+  return {
+    value: `${input.slice(0, keep)}${SNAPSHOT_TRUNCATE_SUFFIX}`,
+    truncated: true,
+  }
+}
+
+function limitArray<T>(items: T[] | null | undefined, maxCount: number): { value: T[] | undefined; truncated: boolean } {
+  if (!items) return { value: items ?? undefined, truncated: false }
+  if (items.length <= maxCount) return { value: items, truncated: false }
+  return { value: items.slice(0, maxCount), truncated: true }
+}
+
+function pruneTreemapRoot(
+  root: TreemapNode,
+  maxNodes: number,
+  maxDepth: number,
+  maxChildrenPerDir: number,
+): { value: TreemapNode; truncated: boolean } {
+  let truncated = false
+  let remainingNodes = Math.max(0, maxNodes - 1)
+
+  const cloneNode = (node: TreemapNode, depth: number): TreemapNode => {
+    const cloned: TreemapNode = {
+      name: node.name,
+      path: node.path,
+      size: node.size,
+      is_dir: node.is_dir,
+      modified: node.modified,
+    }
+
+    const children = node.children ?? []
+    if (children.length === 0) return cloned
+    if (depth >= maxDepth || remainingNodes <= 0) {
+      truncated = true
+      return cloned
+    }
+
+    const limitedChildren: TreemapNode[] = []
+    for (const child of children) {
+      if (limitedChildren.length >= maxChildrenPerDir || remainingNodes <= 0) {
+        truncated = true
+        break
+      }
+      remainingNodes -= 1
+      limitedChildren.push(cloneNode(child, depth + 1))
+    }
+
+    if (limitedChildren.length > 0) {
+      cloned.children = limitedChildren
+    } else if (children.length > 0) {
+      truncated = true
+    }
+
+    return cloned
+  }
+
+  return { value: cloneNode(root, 0), truncated }
+}
+
+function appendSnapshotWarning(existing: string | null | undefined, message: string): string {
+  const current = (existing ?? '').trim()
+  if (!current) return message
+  if (current.includes(message)) return current
+  return `${current}; ${message}`
+}
+
+function reduceAnalysisResult(
+  input: AnalysisResult | null,
+  profile: SnapshotPersistProfile,
+): { value: AnalysisResult | null; truncated: boolean } {
+  if (!input) return { value: null, truncated: false }
+
+  let truncated = false
+  const suggestions = input.suggestions.slice(0, profile.maxSuggestions).map((item) => {
+    const msg = truncateText(item.message, profile.maxSuggestionMessageChars)
+    if (msg.truncated) truncated = true
+    return { ...item, message: msg.value }
+  })
+  if (suggestions.length < input.suggestions.length) {
+    truncated = true
+  }
+
+  const summary = truncateText(input.summary, profile.maxAnalysisSummaryChars)
+  const promptText = truncateText(input.promptText ?? '', profile.maxAnalysisPromptChars)
+  const rawText = truncateText(input.rawText ?? '', profile.maxAnalysisRawChars)
+  if (summary.truncated || promptText.truncated || rawText.truncated) {
+    truncated = true
+  }
+
+  return {
+    value: {
+      ...input,
+      suggestions,
+      summary: summary.value,
+      promptText: input.promptText == null ? undefined : promptText.value,
+      rawText: input.rawText == null ? undefined : rawText.value,
+    },
+    truncated,
+  }
+}
+
+function reduceSnapshotForPersist(snapshot: Snapshot, profile: SnapshotPersistProfile): { value: Snapshot; truncated: boolean } {
+  let truncated = false
+
+  const summary = truncateText(snapshot.summary, profile.maxSummaryChars)
+  const aiPrompt = truncateText(snapshot.ai_prompt, profile.maxAiPromptChars)
+  const aiRawText = truncateText(snapshot.ai_raw_text, profile.maxAiRawTextChars)
+  if (summary.truncated || aiPrompt.truncated || aiRawText.truncated) {
+    truncated = true
+  }
+
+  const analysis = reduceAnalysisResult(snapshot.ai_structured_result, profile)
+  if (analysis.truncated) truncated = true
+
+  const topFiles = limitArray(snapshot.scanResult.top_files ?? undefined, profile.maxTopEntries)
+  const topDirectories = limitArray(snapshot.scanResult.top_directories ?? undefined, profile.maxTopEntries)
+  const rootChildren = limitArray(snapshot.scanResult.root_children ?? undefined, profile.maxTopEntries)
+  const extensionStats = limitArray(snapshot.scanResult.extension_stats ?? undefined, profile.maxTopEntries)
+  if (topFiles.truncated || topDirectories.truncated || rootChildren.truncated || extensionStats.truncated) {
+    truncated = true
+  }
+
+  const root = pruneTreemapRoot(
+    snapshot.scanResult.root,
+    profile.maxTreeNodes,
+    profile.maxTreeDepth,
+    profile.maxChildrenPerDir,
+  )
+  if (root.truncated) truncated = true
+
+  const warningMessage = 'Snapshot payload was truncated to avoid oversized JSON serialization.'
+  const scanWarning = truncated
+    ? appendSnapshotWarning(snapshot.scanResult.scan_warning, warningMessage)
+    : snapshot.scanResult.scan_warning
+
+  return {
+    truncated,
+    value: {
+      ...snapshot,
+      summary: summary.value,
+      ai_prompt: aiPrompt.value,
+      ai_raw_text: aiRawText.value,
+      ai_structured_result: analysis.value,
+      scanResult: {
+        ...snapshot.scanResult,
+        root: root.value,
+        top_files: topFiles.value ?? null,
+        top_directories: topDirectories.value ?? null,
+        root_children: rootChildren.value ?? null,
+        extension_stats: extensionStats.value ?? null,
+        scan_warning: scanWarning,
+      },
+    },
+  }
+}
+
+async function writeSnapshotWithFallback(filePath: string, snapshot: Snapshot): Promise<Snapshot> {
+  try {
+    await writeJSON(filePath, snapshot)
+    return snapshot
+  } catch (error) {
+    if (!isInvalidStringLengthError(error)) {
+      throw error
+    }
+    console.warn('[snapshot] Full snapshot too large, falling back to reduced profile')
+  }
+
+  const reduced = reduceSnapshotForPersist(snapshot, SNAPSHOT_PERSIST_PROFILE_REDUCED)
+  try {
+    await writeJSON(filePath, reduced.value)
+    if (reduced.truncated) {
+      console.warn('[snapshot] Snapshot saved with reduced profile truncation')
+    }
+    return reduced.value
+  } catch (error) {
+    if (!isInvalidStringLengthError(error)) {
+      throw error
+    }
+    console.warn('[snapshot] Reduced profile still too large, falling back to minimal profile')
+  }
+
+  const minimal = reduceSnapshotForPersist(snapshot, SNAPSHOT_PERSIST_PROFILE_MINIMAL)
+  await writeJSON(filePath, minimal.value)
+  if (minimal.truncated) {
+    console.warn('[snapshot] Snapshot saved with minimal profile truncation')
+  }
+  return minimal.value
 }
 
 function sanitizeFilePart(input: string): string {
@@ -162,6 +415,34 @@ function candidateSnapshotPaths(metadata: SnapshotMetadata | undefined, id: stri
   return primary === legacy ? [primary] : [primary, legacy]
 }
 
+function isPathNotFoundError(error: unknown): boolean {
+  const text = String(error).toLowerCase()
+  return (
+    text.includes('not exist') ||
+    text.includes('does not exist') ||
+    text.includes('cannot find') ||
+    text.includes('no such file') ||
+    text.includes('no such path') ||
+    text.includes('path not found') ||
+    text.includes('路径不存在')
+  )
+}
+
+function getSnapshotDirectoryPath(relativeFilePath: string): string {
+  const normalized = relativeFilePath.trim().replace(/\\/g, '/').replace(/^\/+/, '')
+  if (!normalized) return LEGACY_SNAPSHOT_DIR
+  const idx = normalized.lastIndexOf('/')
+  if (idx <= 0) return LEGACY_SNAPSHOT_DIR
+  return normalized.slice(0, idx)
+}
+
+function joinStoragePath(storageRoot: string, relativePath: string): string {
+  const root = storageRoot.trim().replace(/[\\/]+$/, '')
+  const relative = relativePath.trim().replace(/^[/\\]+/, '').replace(/\\/g, '/')
+  if (!relative) return root
+  return `${root}/${relative}`
+}
+
 export async function loadSnapshots(): Promise<SnapshotMetadata[]> {
   return await loadSnapshotIndex()
 }
@@ -207,7 +488,7 @@ export async function saveSnapshot(snapshot: SaveSnapshotInput): Promise<Snapsho
     file_name: fileName,
   }
 
-  await writeJSON(filePath, newSnapshot)
+  const persistedSnapshot = await writeSnapshotWithFallback(filePath, newSnapshot)
   index.unshift(metadata)
 
   if (index.length > SNAPSHOT_LIMIT) {
@@ -222,7 +503,7 @@ export async function saveSnapshot(snapshot: SaveSnapshotInput): Promise<Snapsho
   }
 
   await saveSnapshotIndex(index)
-  return newSnapshot
+  return persistedSnapshot
 }
 
 export async function deleteSnapshot(id: string): Promise<void> {
@@ -265,5 +546,29 @@ export async function updateSnapshotName(id: string, name: string): Promise<void
     snapshot.name = name
     await writeJSON(filePath, snapshot)
     return
+  }
+}
+
+export async function openSnapshotDirectory(metadata: SnapshotMetadata): Promise<OpenSnapshotDirectoryResult> {
+  const storageRoot = await getStoragePath()
+  if (!storageRoot || storageRoot.startsWith(BROWSER_STORAGE_PREFIX)) {
+    return 'unsupported'
+  }
+
+  const relativeFilePath = resolveSnapshotPath(metadata, metadata.id)
+  const relativeDir = getSnapshotDirectoryPath(relativeFilePath)
+  const absoluteDir = joinStoragePath(storageRoot, relativeDir)
+
+  try {
+    await invoke('open_in_file_manager', {
+      path: absoluteDir,
+      isFile: false,
+    })
+    return 'ok'
+  } catch (error) {
+    if (isPathNotFoundError(error)) {
+      return 'not_found'
+    }
+    throw error
   }
 }

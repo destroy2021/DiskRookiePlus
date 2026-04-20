@@ -525,7 +525,7 @@ function ConfigDialog({
       <DialogTitle sx={{ pb: 1 }} className="dark:text-gray-100">
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
           <Cloud size={22} className="text-primary" />
-          <Typography variant="h6" sx={{ fontWeight: 700, fontSize: '16px' }}>
+          <Typography variant="h6" component="span" sx={{ fontWeight: 700, fontSize: '16px' }}>
             {config ? t('cloudStorage.editCloud') : t('cloudStorage.addCloud')}
           </Typography>
         </Box>

@@ -22,6 +22,9 @@ interface Props {
   onToggleAction?: () => void  // 切换操作类型（删除 <-> 迁移）
   originalAction?: 'delete' | 'move'  // 原始操作类型，用于判断是否已切换
   onAddToSafeList?: (path: string) => void  // 加入安全名单（点击后由父组件弹窗确认）
+  onSelectionDragStart?: (path: string, selected: boolean) => void
+  onSelectionDragEnter?: (path: string) => void
+  onSelectionDragEnd?: () => void
 }
 
 // 解析文件大小字符串为字节数
@@ -43,7 +46,21 @@ function parseSizeToBytes(sizeStr: string): number {
   return Math.floor(value * (units[unit] || 1))
 }
 
-export function SuggestionCard({ suggestion, onDelete, onMove, onOpenCloudSettings, selected = false, onSelectChange, task, onToggleAction, originalAction, onAddToSafeList }: Props) {
+export function SuggestionCard({
+  suggestion,
+  onDelete,
+  onMove,
+  onOpenCloudSettings,
+  selected = false,
+  onSelectChange,
+  task,
+  onToggleAction,
+  originalAction,
+  onAddToSafeList,
+  onSelectionDragStart,
+  onSelectionDragEnter,
+  onSelectionDragEnd,
+}: Props) {
   const { t } = useTranslation()
   const [showConfirm, setShowConfirm] = useState(false)
   const [showDetail, setShowDetail] = useState(false)
@@ -175,11 +192,33 @@ export function SuggestionCard({ suggestion, onDelete, onMove, onOpenCloudSettin
   const isTaskUploading = task?.status === 'uploading'
   const isTaskInProgress = isTaskPending || isTaskUploading
   const taskProgress = task?.progress || 0
+  const canDragSelect = Boolean(onSelectChange && onSelectionDragStart && onSelectionDragEnter)
+
+  const handleOpenInFileManager = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    try {
+      await invoke('open_in_file_manager', {
+        path: suggestion.path,
+        isFile: suggestion.type === 'file',
+      })
+    } catch (err) {
+      setToastMessage(String(err))
+      setToastOpen(true)
+    }
+  }
 
   return (
     <>
       {/* 简化的卡片 */}
-      <div className="bg-white dark:bg-gray-800 border border-slate-200 dark:border-gray-700 rounded-xl p-3 hover:border-slate-300 dark:hover:border-gray-600 transition-all">
+      <div
+        className="bg-white dark:bg-gray-800 border border-slate-200 dark:border-gray-700 rounded-xl p-3 hover:border-slate-300 dark:hover:border-gray-600 transition-all"
+        onMouseEnter={() => {
+          onSelectionDragEnter?.(suggestion.path)
+        }}
+        onMouseUp={() => {
+          onSelectionDragEnd?.()
+        }}
+      >
         <div className="flex items-center gap-3">
           {/* 左侧复选框 */}
           {onSelectChange && (
@@ -191,6 +230,12 @@ export function SuggestionCard({ suggestion, onDelete, onMove, onOpenCloudSettin
                 onSelectChange(suggestion.path, e.target.checked)
               }}
               onClick={(e) => e.stopPropagation()}
+              onMouseDown={(e) => {
+                e.stopPropagation()
+                if (canDragSelect && e.button === 0) {
+                  onSelectionDragStart?.(suggestion.path, selected)
+                }
+              }}
               sx={{
                 p: 0.5,
                 color: 'text.secondary',
@@ -316,6 +361,25 @@ export function SuggestionCard({ suggestion, onDelete, onMove, onOpenCloudSettin
                 <ArrowLeftRight size={14} />
               </Button>
             )}
+            <Button
+              size="small"
+              onClick={handleOpenInFileManager}
+              sx={{
+                minWidth: 'auto',
+                px: 1.5,
+                py: 0.5,
+                fontSize: '11px',
+                textTransform: 'none',
+                color: 'text.secondary',
+                borderRadius: '6px',
+                '&:hover': {
+                  bgcolor: 'action.hover',
+                }
+              }}
+              title={t('suggestion.openInFileManager')}
+            >
+              <FolderOpen size={14} />
+            </Button>
             <Button
               size="small"
               onClick={(e) => {

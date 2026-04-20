@@ -35,6 +35,8 @@ pub struct ScanResult {
     /// 当 MFT 扫描失败（如 I/O 错误）并回退到普通扫描时，在此标注错误信息，前端可提示「此磁盘的扫描有错误」
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_warning: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
     /// 卷总容量（字节），由操作系统 API 获取，仅 Windows 卷根扫描时可能为 Some
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_total_bytes: Option<u64>,
@@ -90,6 +92,7 @@ mod tests {
         assert!(parsed.top_directories.is_empty());
         assert!(parsed.root_children.is_empty());
         assert!(parsed.extension_stats.is_empty());
+        assert!(!parsed.interrupted);
     }
 
     #[test]
@@ -100,6 +103,7 @@ mod tests {
             file_count: 0,
             total_size: 0,
             scan_warning: None,
+            interrupted: false,
             volume_total_bytes: None,
             volume_free_bytes: None,
             top_files: None,

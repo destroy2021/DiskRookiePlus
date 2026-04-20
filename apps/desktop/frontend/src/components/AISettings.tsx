@@ -54,7 +54,7 @@ import {
   runKimiDeviceLogin,
   isKimiCodingApiUrl,
 } from '../services/kimi-oauth'
-import { loadAppSettings, saveAppSettings, type AppSettings } from '../services/settings'
+import { loadAppSettings, saveAppSettings, DEFAULT_SNAPSHOT_SAVE_DIR, type AppSettings } from '../services/settings'
 import { CloudStorageSettings } from './CloudStorageSettings'
 import { setLanguage, supportedLanguages } from '../i18n'
 import { readStorageFile, writeStorageFile } from '../services/storage'
@@ -106,7 +106,7 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
   const [appSettings, setAppSettings] = useState<AppSettings>({
     promptFileCount: 100,
     useMftScan: true,
-    snapshotSaveDir: 'snapshots',
+    snapshotSaveDir: DEFAULT_SNAPSHOT_SAVE_DIR,
     autoSaveAfterAi: false,
   })
   const [showApiKey, setShowApiKey] = useState(false)
@@ -879,7 +879,7 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                 <TextField
                   size="small"
                   fullWidth
-                  value={appSettings.snapshotSaveDir ?? 'snapshots'}
+                  value={appSettings.snapshotSaveDir ?? DEFAULT_SNAPSHOT_SAVE_DIR}
                   onChange={(e) => setAppSettings(s => ({ ...s, snapshotSaveDir: e.target.value }))}
                   onBlur={() => {
                     void persistAppSettings(appSettings)
@@ -1120,7 +1120,7 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                 setAppSettings({
                   promptFileCount: 100,
                   useMftScan: true,
-                  snapshotSaveDir: 'snapshots',
+                  snapshotSaveDir: DEFAULT_SNAPSHOT_SAVE_DIR,
                   autoSaveAfterAi: false,
                 })
                 setCustomUrl('')

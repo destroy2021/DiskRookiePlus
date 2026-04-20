@@ -16,9 +16,11 @@ import {
   Tooltip,
   InputAdornment,
   CircularProgress,
+  Menu,
+  MenuItem,
 } from '@mui/material'
 import { X, Search, Trash2, FolderOpen, Clock, HardDrive, FileStack } from 'lucide-react'
-import { loadSnapshots, deleteSnapshot, getSnapshot, type Snapshot, type SnapshotMetadata } from '../services/snapshot'
+import { loadSnapshots, deleteSnapshot, getSnapshot, openSnapshotDirectory, type Snapshot, type SnapshotMetadata } from '../services/snapshot'
 import { formatBytes } from '../utils/format'
 
 interface Props {
@@ -32,6 +34,11 @@ export function SnapshotDialog({ open, onClose, onLoadSnapshot }: Props) {
   const [searchQuery, setSearchQuery] = useState('')
   const [snapshots, setSnapshots] = useState<SnapshotMetadata[]>([])
   const [loading, setLoading] = useState(true)
+  const [contextMenu, setContextMenu] = useState<{
+    snapshot: SnapshotMetadata
+    mouseX: number
+    mouseY: number
+  } | null>(null)
 
   // 加载快照列表
   useEffect(() => {
@@ -41,6 +48,8 @@ export function SnapshotDialog({ open, onClose, onLoadSnapshot }: Props) {
         setSnapshots(data)
         setLoading(false)
       })
+    } else {
+      setContextMenu(null)
     }
   }, [open])
 
@@ -76,6 +85,36 @@ export function SnapshotDialog({ open, onClose, onLoadSnapshot }: Props) {
       showNotification(t('snapshot.loadFailed'), String(error))
     } finally {
       setLoading(false)
+    }
+  }
+
+  const handleContextMenu = (event: React.MouseEvent, snapshot: SnapshotMetadata) => {
+    event.preventDefault()
+    setContextMenu({
+      snapshot,
+      mouseX: event.clientX - 2,
+      mouseY: event.clientY - 4,
+    })
+  }
+
+  const handleCloseContextMenu = () => {
+    setContextMenu(null)
+  }
+
+  const handleOpenSnapshotFolder = async () => {
+    const target = contextMenu?.snapshot
+    if (!target) return
+    setContextMenu(null)
+
+    try {
+      const openResult = await openSnapshotDirectory(target)
+      if (openResult === 'not_found') {
+        showNotification(t('snapshot.openFolderFailed'), t('snapshot.folderNotExist'))
+      } else if (openResult === 'unsupported') {
+        showNotification(t('snapshot.openFolderFailed'), t('snapshot.openFolderUnsupported'))
+      }
+    } catch (error) {
+      showNotification(t('snapshot.openFolderFailed'), String(error))
     }
   }
 
@@ -128,7 +167,7 @@ export function SnapshotDialog({ open, onClose, onLoadSnapshot }: Props) {
               <FolderOpen size={20} style={{ color: '#1A1A1A' }} />
             </Box>
             <Box>
-              <Typography variant="h6" sx={{ fontWeight: 700, fontSize: '18px' }}>
+              <Typography variant="h6" component="span" sx={{ fontWeight: 700, fontSize: '18px' }}>
                 {t('snapshot.management')}
               </Typography>
               <Typography variant="caption" sx={{ color: 'text.secondary' }}>
@@ -237,6 +276,7 @@ export function SnapshotDialog({ open, onClose, onLoadSnapshot }: Props) {
               >
                 <ListItemButton
                   onClick={() => handleLoad(snapshot)}
+                  onContextMenu={(e) => handleContextMenu(e, snapshot)}
                   sx={{
                     borderRadius: '12px',
                     border: '1px solid',
@@ -323,6 +363,20 @@ export function SnapshotDialog({ open, onClose, onLoadSnapshot }: Props) {
             ))}
           </List>
         )}
+        <Menu
+          open={contextMenu !== null}
+          onClose={handleCloseContextMenu}
+          anchorReference="anchorPosition"
+          anchorPosition={
+            contextMenu
+              ? { top: contextMenu.mouseY, left: contextMenu.mouseX }
+              : undefined
+          }
+        >
+          <MenuItem onClick={() => void handleOpenSnapshotFolder()}>
+            {t('snapshot.openFolder')}
+          </MenuItem>
+        </Menu>
       </DialogContent>
     </Dialog>
   )

@@ -1,4 +1,5 @@
 mod commands;
+mod logging;
 mod panic_hook;
 
 use commands::oauth::OAuthState;
@@ -7,22 +8,23 @@ use commands::oauth::OAuthState;
 pub fn run() {
     panic_hook::install_broken_pipe_safe_panic_hook();
 
-    // 初始化日志系统（过滤 tao/winit 事件循环的 WARN，避免刷屏）
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .filter_module("tao", log::LevelFilter::Error)
-        .filter_module("winit", log::LevelFilter::Error)
-        .init();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_http::init())
+        .setup(|app| {
+            if let Err(err) = logging::init_app_logging(app.handle()) {
+                eprintln!("日志系统初始化失败: {err}");
+            }
+            Ok(())
+        })
+        .manage(commands::scan::ScanCancelRegistry::default())
         .manage(OAuthState::default())
         .invoke_handler(tauri::generate_handler![
             commands::scan::scan_path_command,
+            commands::scan::cancel_scan_command,
             commands::analyze::analyze_disk,
             commands::plan::get_cleanup_plan,
             commands::execute::execute_plan,
@@ -62,7 +64,11 @@ pub fn run() {
             commands::open_in_file_manager::open_in_file_manager,
             commands::kimi_oauth::kimi_code_request_device,
             commands::kimi_oauth::kimi_code_poll_token,
+            commands::logging::log_frontend_event,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .unwrap_or_else(|err| {
+            log::error!("Tauri 应用运行失败: {err}");
+            eprintln!("Tauri 应用运行失败: {err}");
+        });
 }

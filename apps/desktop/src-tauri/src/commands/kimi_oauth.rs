@@ -40,14 +40,25 @@ pub async fn kimi_code_request_device() -> Result<serde_json::Value, String> {
         .form(&[("client_id", KIMI_CODE_CLIENT_ID)])
         .send()
         .await
-        .map_err(|e| format!("请求设备授权失败: {}", e))?;
+        .map_err(|e| {
+            log::error!("请求设备授权失败: {}", e);
+            format!("请求设备授权失败: {}", e)
+        })?;
 
     let status = res.status();
-    let text = res.text().await.map_err(|e| e.to_string())?;
+    let text = res.text().await.map_err(|e| {
+        log::error!("读取设备授权响应失败: {}", e);
+        e.to_string()
+    })?;
     let body: serde_json::Value =
         serde_json::from_str(&text).unwrap_or(serde_json::json!({ "raw": text }));
 
     if !status.is_success() {
+        log::error!(
+            "设备授权请求失败, status: {}, body: {}",
+            status.as_u16(),
+            body
+        );
         return Err(format!(
             "device_authorization HTTP {}: {}",
             status.as_u16(),
@@ -83,10 +94,16 @@ pub async fn kimi_code_poll_token(device_code: String) -> Result<KimiPollTokenRe
         ])
         .send()
         .await
-        .map_err(|e| format!("轮询 token 失败: {}", e))?;
+        .map_err(|e| {
+            log::error!("轮询 token 失败: {}", e);
+            format!("轮询 token 失败: {}", e)
+        })?;
 
     let status = res.status().as_u16();
-    let text = res.text().await.map_err(|e| e.to_string())?;
+    let text = res.text().await.map_err(|e| {
+        log::error!("读取 token 轮询响应失败: {}", e);
+        e.to_string()
+    })?;
     let body: serde_json::Value =
         serde_json::from_str(&text).unwrap_or(serde_json::json!({ "raw": text }));
 

@@ -265,7 +265,7 @@ export function TaskQueueDialog({
               <Cloud size={20} className="text-gray-900" />
             </Box>
             <Box>
-              <Typography variant="h6" sx={{ fontWeight: 700, fontSize: '16px' }}>
+              <Typography variant="h6" component="span" sx={{ fontWeight: 700, fontSize: '16px' }}>
                 {t('taskQueue.title')}
               </Typography>
               <Typography variant="caption" sx={{ color: 'text.secondary' }}>

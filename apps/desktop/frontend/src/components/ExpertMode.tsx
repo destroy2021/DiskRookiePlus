@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { open } from '@tauri-apps/plugin-dialog'
 import { showNotification } from '../services/notification'
-import { Folder, Cpu, MessageSquare, Copy, CheckCircle2, AlertCircle, Settings, Clock, FileStack, HardDrive, Sparkles, Save, Cloud, Play, Shield } from 'lucide-react'
+import { Folder, Cpu, MessageSquare, Copy, CheckCircle2, AlertCircle, Settings, Clock, FileStack, HardDrive, Sparkles, Save, Cloud, Play, Shield, StopCircle } from 'lucide-react'
 import { Button, TextField, Typography, Fade, Tooltip, Dialog, DialogTitle, DialogContent, DialogActions, Slider, Box, FormHelperText, Checkbox, FormControlLabel } from '@mui/material'
 import { PieChart, Pie, Cell, ResponsiveContainer } from 'recharts'
 import { Treemap, type TreemapNode } from './Treemap'
@@ -46,6 +46,7 @@ interface ScanResult {
     file_count: number
     total_size: number
     scan_warning?: string | null
+    interrupted?: boolean
     volume_total_bytes?: number | null
     volume_free_bytes?: number | null
     top_files?: TopFileEntry[] | null
@@ -101,6 +102,14 @@ function buildDefaultSnapshotName(path: string): string {
 
 const DEFAULT_PROMPT_INSTRUCTION = '请基于以上磁盘摘要，识别可安全清理或迁移的候选项，并给出简明理由。'
 const SKIP_SAFELIST_CONFIRM_KEY = 'skip-add-to-safelist-confirm'
+
+function isAbortError(error: unknown): boolean {
+    if (!error) return false
+    if (error instanceof DOMException && error.name === 'AbortError') return true
+    if (error instanceof Error && error.name === 'AbortError') return true
+    const text = String(error).toLowerCase()
+    return text.includes('aborterror') || text.includes('aborted') || text.includes('interrupted')
+}
 
 async function loadPromptInstruction(): Promise<string> {
     try {
@@ -547,11 +556,24 @@ export interface ExpertModeProps {
     tasks?: Task[]
 }
 
+type SnapshotDecisionAction = 'save' | 'skip'
+
+interface PendingAiSnapshotDecision {
+    path: string
+    scanResult: ScanResult
+    summary: string
+    aiPrompt: string
+    aiRawText: string
+    aiStructuredResult: AnalysisResult
+    defaultAction: SnapshotDecisionAction
+}
+
 export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, settingsSavedTrigger, onAddMigrateTask, onFileDeleted, tasks = [] }: ExpertModeProps) {
     const { t } = useTranslation()
     const isTauriRuntime = typeof window !== 'undefined' && Boolean((window as Window & { __TAURI_INTERNALS__?: { metadata?: unknown } }).__TAURI_INTERNALS__?.metadata)
     const [path, setPath] = useState('')
     const [status, setStatus] = useState<'idle' | 'scanning' | 'done' | 'error'>('idle')
+    const [scanCanceling, setScanCanceling] = useState(false)
     const [errorMsg, setErrorMsg] = useState('')
     const [result, setResult] = useState<ScanResult | null>(null)
     const [isAdmin, setIsAdmin] = useState<boolean | null>(false)
@@ -564,7 +586,9 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
 
     const [aiAnalyzing, setAiAnalyzing] = useState(false)
     const [aiProgress, setAiProgress] = useState('')
+    const aiAbortControllerRef = useRef<AbortController | null>(null)
     const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null)
+    const [hasAnalyzedOnce, setHasAnalyzedOnce] = useState(false)
     const [latestSummary, setLatestSummary] = useState('')
     const [latestAiPrompt, setLatestAiPrompt] = useState('')
     const [latestAiRawText, setLatestAiRawText] = useState('')
@@ -573,9 +597,20 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
     const [hoveredPieIndex, setHoveredPieIndex] = useState<number | null>(null)
     const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set())
     const [actionOverrides, setActionOverrides] = useState<Map<string, 'delete' | 'move'>>(new Map())
+    const dragSelectStateRef = useRef<{ active: boolean; mode: 'select' | 'deselect' }>({
+        active: false,
+        mode: 'select',
+    })
+    const [isDragSelecting, setIsDragSelecting] = useState(false)
 
     const [showSaveDialog, setShowSaveDialog] = useState(false)
     const [snapshotName, setSnapshotName] = useState('')
+    const [showAiSnapshotDecisionDialog, setShowAiSnapshotDecisionDialog] = useState(false)
+    const [aiSnapshotDontShowForSession, setAiSnapshotDontShowForSession] = useState(false)
+    const [aiSnapshotDecisionDefaultAction, setAiSnapshotDecisionDefaultAction] = useState<SnapshotDecisionAction>('skip')
+    const [aiSnapshotDecisionRememberForSession, setAiSnapshotDecisionRememberForSession] = useState(false)
+    const [aiSnapshotDecisionSaving, setAiSnapshotDecisionSaving] = useState(false)
+    const [pendingAiSnapshotDecision, setPendingAiSnapshotDecision] = useState<PendingAiSnapshotDecision | null>(null)
 
     const [safeListDialog, setSafeListDialog] = useState<{ open: boolean; path: string | null; dontRemind: boolean }>({ open: false, path: null, dontRemind: false })
     const [addedToSafeListPaths, setAddedToSafeListPaths] = useState<Set<string>>(new Set())
@@ -608,9 +643,57 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         }
     }, [isTauriRuntime])
 
+    const saveAiDecisionSnapshot = useCallback(async (decision: PendingAiSnapshotDecision) => {
+        const normalizedPath = decision.path.trim()
+        if (!normalizedPath) {
+            throw new Error(t('snapshot.pathRequiredForSave'))
+        }
+        const autoSnapshotName = buildDefaultSnapshotName(normalizedPath)
+        await saveSnapshot({
+            name: autoSnapshotName,
+            path: normalizedPath,
+            scanResult: decision.scanResult,
+            summary: decision.summary,
+            ai_prompt: decision.aiPrompt,
+            ai_raw_text: decision.aiRawText,
+            ai_structured_result: decision.aiStructuredResult,
+        })
+        await showNotification(t('snapshot.saveSuccess'), t('snapshot.savedSnapshot', { name: autoSnapshotName }))
+    }, [t])
+
+    const triggerAiSnapshotDecision = useCallback(async (
+        decision: Omit<PendingAiSnapshotDecision, 'defaultAction'>,
+        defaultAction: SnapshotDecisionAction,
+    ) => {
+        if (aiSnapshotDontShowForSession) {
+            if (aiSnapshotDecisionDefaultAction === 'save') {
+                try {
+                    await saveAiDecisionSnapshot({ ...decision, defaultAction: aiSnapshotDecisionDefaultAction })
+                } catch (error) {
+                    await showNotification(t('snapshot.saveFailed'), String(error))
+                }
+            }
+            return
+        }
+
+        setPendingAiSnapshotDecision({ ...decision, defaultAction })
+        setAiSnapshotDecisionRememberForSession(false)
+        setShowAiSnapshotDecisionDialog(true)
+    }, [aiSnapshotDecisionDefaultAction, aiSnapshotDontShowForSession, saveAiDecisionSnapshot, t])
+
     const runAiAnalysis = useCallback(async (scanResult: ScanResult) => {
+        if (aiAnalyzing) return
+
+        const abortController = new AbortController()
+        aiAbortControllerRef.current = abortController
         setAiAnalyzing(true)
         setAiProgress(t('aiAnalysis.preparing'))
+        setAnalysisResult(null)
+        setSelectedItems(new Set())
+        setActionFilter('all')
+        setActionOverrides(new Map())
+        setLatestAiPrompt('')
+        setLatestAiRawText('')
         try {
             const appSettings = await loadAppSettings()
             const aiSettings = await loadSettings()
@@ -618,51 +701,104 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                 throw new Error('Please configure API key in settings first.')
             }
             const summary = await buildFileListSummary(scanResult, appSettings.promptFileCount)
+            if (abortController.signal.aborted) return
             setLatestSummary(summary)
-            const aiResult = await analyzeWithAI(summary, (msg) => setAiProgress(msg))
+            const aiResult = await analyzeWithAI(summary, (msg) => setAiProgress(msg), abortController.signal)
+            if (abortController.signal.aborted) return
             setAnalysisResult(aiResult)
+            setHasAnalyzedOnce(true)
             setLatestAiPrompt(aiResult.promptText ?? '')
             setLatestAiRawText(aiResult.rawText ?? '')
+
+            if (aiResult.interrupted) {
+                await showNotification(t('aiAnalysis.canceled'), aiResult.summary || t('aiAnalysis.canceled'))
+                return
+            }
+
             const suggestionCount = aiResult.suggestions.length
             const notificationBody = suggestionCount > 0
                 ? t('aiAnalysis.foundSuggestions', { count: suggestionCount })
                 : aiResult.summary || t('aiAnalysis.noSuggestions')
             await showNotification(t('aiAnalysis.complete'), notificationBody)
-            if (appSettings.autoSaveAfterAi === true && path.trim()) {
-                const autoSnapshotName = buildDefaultSnapshotName(path)
-                await saveSnapshot({
-                    name: autoSnapshotName,
-                    path,
-                    scanResult,
-                    summary,
-                    ai_prompt: aiResult.promptText ?? '',
-                    ai_raw_text: aiResult.rawText ?? '',
-                    ai_structured_result: aiResult,
-                })
-                await showNotification(t('snapshot.saveSuccess'), t('snapshot.savedSnapshot', { name: autoSnapshotName }))
-            }
+
+            const defaultAction: SnapshotDecisionAction = appSettings.autoSaveAfterAi === true ? 'save' : 'skip'
+            await triggerAiSnapshotDecision({
+                path: path.trim(),
+                scanResult,
+                summary,
+                aiPrompt: aiResult.promptText ?? '',
+                aiRawText: aiResult.rawText ?? '',
+                aiStructuredResult: aiResult,
+            }, defaultAction)
         } catch (aiError) {
+            if (isAbortError(aiError)) {
+                console.info('[AI] Analysis canceled by user action.')
+                return
+            }
             setErrorMsg(`${t('aiAnalysis.failed')}: ${aiError}`)
             await showNotification(t('aiAnalysis.failed'), String(aiError))
         } finally {
+            if (aiAbortControllerRef.current === abortController) {
+                aiAbortControllerRef.current = null
+            }
             setAiAnalyzing(false)
             setAiProgress('')
         }
-    }, [path, t])
+    }, [aiAnalyzing, path, t, triggerAiSnapshotDecision])
+
+    const cancelAiAnalysis = useCallback(() => {
+        const controller = aiAbortControllerRef.current
+        if (!controller) return
+        controller.abort()
+        aiAbortControllerRef.current = null
+        console.info('[AI] Analysis canceled by user.')
+    }, [])
 
     const runScan = useCallback(async (targetPath: string) => {
         if (!targetPath) return
         const pathToScan = normalizeScanPath(targetPath)
-        setStatus('scanning'); setErrorMsg(''); setResult(null); setProgressFiles(0); setProgressMessage(''); setAnalysisResult(null); setLatestSummary(''); setLatestAiPrompt(''); setLatestAiRawText(''); setActionFilter('all'); setActionOverrides(new Map());
+        setStatus('scanning'); setScanCanceling(false); setErrorMsg(''); setResult(null); setProgressFiles(0); setProgressMessage(''); setAnalysisResult(null); setHasAnalyzedOnce(false); setLatestSummary(''); setLatestAiPrompt(''); setLatestAiRawText(''); setActionFilter('all'); setActionOverrides(new Map());
         try {
             const appSettings = await loadAppSettings()
             const useMft = appSettings.useMftScan !== false
             const res = await invoke<ScanResult>('scan_path_command', { path: pathToScan, shallowDirs, useMft })
-            setResult(res); setStatus('done');
+            setResult(res)
+            setStatus('done')
+            if (res.interrupted) {
+                await showNotification(
+                    t('expertMode.scanInterrupted'),
+                    t('expertMode.scanInterruptedHint', { count: res.file_count })
+                )
+            }
         } catch (e) {
             setStatus('error'); setErrorMsg(String(e));
+        } finally {
+            setScanCanceling(false)
         }
-    }, [shallowDirs])
+    }, [shallowDirs, t])
+
+    const cancelScan = useCallback(async () => {
+        if (status !== 'scanning') return
+        setScanCanceling(true)
+        try {
+            const accepted = await invoke<boolean>('cancel_scan_command')
+            if (!accepted) {
+                setScanCanceling(false)
+            }
+        } catch (e) {
+            setScanCanceling(false)
+            await showNotification(t('expertMode.stopScanFailed'), String(e))
+        }
+    }, [status, t])
+
+    useEffect(() => {
+        return () => {
+            if (aiAbortControllerRef.current) {
+                aiAbortControllerRef.current.abort()
+                aiAbortControllerRef.current = null
+            }
+        }
+    }, [])
 
     const handleBrowseFolder = useCallback(async () => {
         const selected = await open({ directory: true, multiple: false });
@@ -676,6 +812,14 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         if (viewMode === next) return
         setViewMode(next)
     }, [viewMode])
+
+    const handleSwitchStandardMode = useCallback(() => {
+        setIsAdmin(false)
+    }, [])
+
+    const handleSwitchDeveloperMode = useCallback(() => {
+        setIsAdmin(true)
+    }, [])
 
     const handleDelete = useCallback(async (itemPath: string) => {
         await deleteItem(itemPath)
@@ -699,6 +843,39 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         })
     }, [])
 
+    const applyDragSelection = useCallback((path: string) => {
+        const dragState = dragSelectStateRef.current
+        if (!dragState.active) return
+        setSelectedItems(prev => {
+            const next = new Set(prev)
+            if (dragState.mode === 'select') {
+                next.add(path)
+            } else {
+                next.delete(path)
+            }
+            return next
+        })
+    }, [])
+
+    const handleSelectionDragStart = useCallback((path: string, selected: boolean) => {
+        dragSelectStateRef.current = {
+            active: true,
+            mode: selected ? 'deselect' : 'select',
+        }
+        setIsDragSelecting(true)
+        applyDragSelection(path)
+    }, [applyDragSelection])
+
+    const handleSelectionDragEnter = useCallback((path: string) => {
+        applyDragSelection(path)
+    }, [applyDragSelection])
+
+    const handleSelectionDragEnd = useCallback(() => {
+        if (!dragSelectStateRef.current.active) return
+        dragSelectStateRef.current.active = false
+        setIsDragSelecting(false)
+    }, [])
+
     const handleToggleAction = useCallback((path: string, currentAction: 'delete' | 'move') => {
         setActionOverrides(prev => {
             const next = new Map(prev)
@@ -706,6 +883,22 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
             next.set(path, newAction)
             return next
         })
+    }, [])
+
+    useEffect(() => {
+        const releaseDrag = () => {
+            if (!dragSelectStateRef.current.active) return
+            dragSelectStateRef.current.active = false
+            setIsDragSelecting(false)
+        }
+
+        window.addEventListener('mouseup', releaseDrag)
+        window.addEventListener('blur', releaseDrag)
+
+        return () => {
+            window.removeEventListener('mouseup', releaseDrag)
+            window.removeEventListener('blur', releaseDrag)
+        }
     }, [])
 
     const getActualAction = useCallback((path: string, originalAction: 'delete' | 'move'): 'delete' | 'move' => {
@@ -890,6 +1083,45 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         setSelectedItems(new Set())
     }, [selectedItems, analysisResult, deletedPaths, addedToSafeListPaths, handleDelete, handleMove, selectedMigrationConfigs, getActualAction, t])
 
+    const handleAiSnapshotDecisionAction = useCallback(async (action: SnapshotDecisionAction) => {
+        const decision = pendingAiSnapshotDecision
+        if (!decision || aiSnapshotDecisionSaving) return
+
+        setAiSnapshotDecisionSaving(true)
+        try {
+            if (action === 'save') {
+                await saveAiDecisionSnapshot(decision)
+            }
+
+            if (aiSnapshotDecisionRememberForSession) {
+                setAiSnapshotDontShowForSession(true)
+                setAiSnapshotDecisionDefaultAction(action)
+            }
+
+            setShowAiSnapshotDecisionDialog(false)
+            setPendingAiSnapshotDecision(null)
+            setAiSnapshotDecisionRememberForSession(false)
+        } catch (error) {
+            await showNotification(t('snapshot.saveFailed'), String(error))
+        } finally {
+            setAiSnapshotDecisionSaving(false)
+        }
+    }, [
+        aiSnapshotDecisionRememberForSession,
+        aiSnapshotDecisionSaving,
+        pendingAiSnapshotDecision,
+        saveAiDecisionSnapshot,
+        t,
+    ])
+
+    const handleAiSnapshotDecisionClose = useCallback(() => {
+        if (aiSnapshotDecisionSaving) return
+        const defaultAction = pendingAiSnapshotDecision?.defaultAction ?? 'skip'
+        const canSave = Boolean(pendingAiSnapshotDecision?.path.trim())
+        const effectiveAction = defaultAction === 'save' && !canSave ? 'skip' : defaultAction
+        void handleAiSnapshotDecisionAction(effectiveAction)
+    }, [aiSnapshotDecisionSaving, handleAiSnapshotDecisionAction, pendingAiSnapshotDecision])
+
     // 保存快照
     const handleSaveSnapshot = useCallback(() => {
         if (!result || !path) return
@@ -947,6 +1179,11 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         setResult(loadedSnapshot.scanResult)
         setStatus('done')
         setAnalysisResult(loadedSnapshot.ai_structured_result ?? null)
+        setHasAnalyzedOnce(Boolean(
+            loadedSnapshot.ai_structured_result
+            || loadedSnapshot.ai_raw_text?.trim()
+            || loadedSnapshot.ai_prompt?.trim()
+        ))
         setLatestSummary(loadedSnapshot.summary ?? '')
         setLatestAiPrompt(loadedSnapshot.ai_prompt ?? '')
         setLatestAiRawText(loadedSnapshot.ai_raw_text ?? '')
@@ -958,6 +1195,7 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
     }, [loadedSnapshot, onSnapshotLoaded])
 
     const [standardModeNoApi, setStandardModeNoApi] = useState(false)
+    const aiAnalyzeActionLabel = hasAnalyzedOnce ? t('aiAnalysis.reanalyze') : t('aiAnalysis.start')
 
     const getTaskForPath = useCallback((filePath: string): Task | undefined => {
         return tasks.find(task => task.sourcePath === filePath && (task.status === 'pending' || task.status === 'uploading'))
@@ -1059,10 +1297,61 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                         >
                             {status === 'scanning' ? t('expertMode.scanning') : t('expertMode.startScan')}
                         </Button>
-                        {result && status === 'done' && isAdmin === false && (
+                        {status === 'scanning' && (
+                            <Button
+                                onClick={() => void cancelScan()}
+                                disabled={scanCanceling}
+                                variant="outlined"
+                                size="small"
+                                startIcon={<StopCircle size={14} />}
+                                sx={{
+                                    borderRadius: '10px',
+                                    px: 2,
+                                    py: 0.9,
+                                    color: 'error.main',
+                                    borderColor: 'error.main',
+                                    textTransform: 'none',
+                                    fontWeight: 600,
+                                    fontSize: '12px',
+                                    '&:hover': {
+                                        bgcolor: 'error.main',
+                                        color: '#fff',
+                                        borderColor: 'error.main',
+                                    }
+                                }}
+                            >
+                                {scanCanceling ? t('expertMode.stoppingScan') : t('expertMode.stopScan')}
+                            </Button>
+                        )}
+                        {result && status === 'done' && aiAnalyzing && (
+                            <Button
+                                onClick={() => cancelAiAnalysis()}
+                                variant="outlined"
+                                size="small"
+                                startIcon={<StopCircle size={14} />}
+                                sx={{
+                                    borderRadius: '10px',
+                                    px: 2,
+                                    py: 0.9,
+                                    color: 'error.main',
+                                    borderColor: 'error.main',
+                                    textTransform: 'none',
+                                    fontWeight: 600,
+                                    fontSize: '12px',
+                                    '&:hover': {
+                                        bgcolor: 'error.main',
+                                        color: '#fff',
+                                        borderColor: 'error.main',
+                                    }
+                                }}
+                            >
+                                {t('aiAnalysis.cancel')}
+                            </Button>
+                        )}
+                        {result && status === 'done' && !aiAnalyzing && isAdmin === false && (
                             <Button
                                 onClick={() => void runAiAnalysis(result)}
-                                disabled={aiAnalyzing || standardModeNoApi}
+                                disabled={standardModeNoApi}
                                 variant="outlined"
                                 size="small"
                                 startIcon={<Sparkles size={14} />}
@@ -1082,7 +1371,7 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                     }
                                 }}
                             >
-                                {aiAnalyzing ? t('aiAnalysis.analyzing') : t('aiAnalysis.start')}
+                                {aiAnalyzeActionLabel}
                             </Button>
                         )}
                         {result && status === 'done' && isAdmin && (
@@ -1127,13 +1416,13 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                         <div className="w-px h-5 bg-slate-200 dark:bg-gray-600 shrink-0" aria-hidden />
                         <div className="bg-slate-200/50 dark:bg-gray-600/50 p-0.5 rounded-lg flex gap-0.5 border border-slate-200/80 dark:border-gray-600">
                             <button
-                                onClick={() => setIsAdmin(false)}
+                                onClick={handleSwitchStandardMode}
                                 className={`px-3 py-1 rounded-md text-[11px] font-semibold transition-all ${!isAdmin ? 'bg-white dark:bg-gray-600 text-secondary shadow-sm' : 'text-slate-500 dark:text-gray-400'}`}
                             >
                                 {t('expertMode.standardMode')}
                             </button>
                             <button
-                                onClick={() => setIsAdmin(true)}
+                                onClick={handleSwitchDeveloperMode}
                                 className={`px-3 py-1 rounded-md text-[11px] font-semibold transition-all ${isAdmin ? 'bg-secondary text-primary shadow-sm' : 'text-slate-500 dark:text-gray-400'}`}
                             >
                                 {t('expertMode.developerMode')}
@@ -1152,6 +1441,11 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                         const tooltipTitle = stats.map(({ label, val }) => `${label}: ${val}`).join(' · ')
                         return (
                             <div className="flex flex-col items-end gap-1">
+                                {result.interrupted && (
+                                    <span className="text-amber-600 dark:text-amber-400 text-xs font-medium">
+                                        {t('expertMode.scanInterruptedTag')}
+                                    </span>
+                                )}
                                 {result.scan_warning && (
                                     <span className="text-amber-600 dark:text-amber-400 text-xs font-medium" title={result.scan_warning}>
                                         {t('expertMode.scanHasError')}
@@ -1263,6 +1557,11 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                     <div className="text-center">
                         <Typography variant="h4" sx={{ fontWeight: 900, color: 'secondary.main' }}>{progressFiles.toLocaleString()}</Typography>
                         <Typography variant="caption" sx={{ color: 'text.secondary', fontWeight: 700, letterSpacing: 2 }}>{t('expertMode.processedFiles')}</Typography>
+                        {scanCanceling && (
+                            <Typography variant="caption" sx={{ display: 'block', mt: 0.5, color: 'warning.main', fontWeight: 600 }}>
+                                {t('expertMode.stoppingScanHint')}
+                            </Typography>
+                        )}
                     </div>
                     <div className="flex gap-1 h-2">
                         {Array.from({ length: 12 }).map((_, i) => (
@@ -1277,32 +1576,18 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
             )}
 
             {aiAnalyzing && (
-                <div className="p-10 flex flex-col items-center justify-center gap-4 animate-in zoom-in-95 duration-500">
-                    <div className="relative">
-                        <Sparkles className="text-primary animate-pulse" size={48} />
-                        <div className="absolute inset-0 bg-primary/20 blur-xl rounded-full" />
-                    </div>
-                    <div className="text-center">
-                        <Typography variant="body1" sx={{ fontWeight: 600, color: 'text.primary', mb: 1 }} className="dark:text-gray-200">
-                            {aiProgress || t('aiAnalysis.analyzing')}
-                        </Typography>
-                        <Typography variant="caption" sx={{ color: 'text.secondary', fontWeight: 700, letterSpacing: 2 }}>
-                            {t('aiAnalysis.analyzing2')}
-                        </Typography>
-                    </div>
-                    <div className="flex gap-1 h-2">
-                        {Array.from({ length: 12 }).map((_, i) => (
-                            <div
-                                key={i}
-                                className="w-4 h-full bg-primary rounded-sm animate-pulse"
-                                style={{ animationDelay: `${i * 0.1}s`, animationDuration: '1.2s' }}
-                            />
-                        ))}
-                    </div>
+                <div className="px-4 py-2 rounded-xl border border-primary/30 bg-primary/5 dark:bg-primary/10 dark:border-primary/40 flex items-center gap-2">
+                    <Sparkles className="text-primary animate-pulse" size={16} />
+                    <Typography variant="caption" sx={{ color: 'text.primary', fontWeight: 600 }}>
+                        {aiProgress || t('aiAnalysis.analyzing')}
+                    </Typography>
+                    <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                        {t('aiAnalysis.backgroundRunning')}
+                    </Typography>
                 </div>
             )}
 
-            {result && !aiAnalyzing && (
+            {result && (
                 <div className="flex-1 flex flex-col gap-4 min-h-0 animate-in slide-in-from-bottom-8 duration-700">
                     {isAdmin === false ? (
                         analysisResult ? (
@@ -1314,10 +1599,25 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                             <span className="text-sm font-semibold text-slate-700 dark:text-gray-200">
                                                 {t('aiAnalysis.result')}
                                             </span>
+                                            {analysisResult.interrupted && (
+                                                <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">
+                                                    {t('aiAnalysis.interruptedTag')}
+                                                </span>
+                                            )}
                                         </div>
                                         <p className="text-xs text-slate-600 dark:text-gray-400 leading-relaxed">
                                             {analysisResult.summary}
                                         </p>
+                                        {analysisResult.continueContextHint && (
+                                            <p className="text-[11px] text-amber-600 dark:text-amber-300 leading-relaxed mt-2">
+                                                {analysisResult.continueContextHint}
+                                            </p>
+                                        )}
+                                        {analysisResult.partial && (
+                                            <p className="text-[10px] text-slate-500 dark:text-gray-400 leading-relaxed mt-1">
+                                                {t('aiAnalysis.partialTag', { count: analysisResult.droppedSuggestions ?? 0 })}
+                                            </p>
+                                        )}
                                         {analysisResult.tokenUsage && (
                                             <Tooltip title={`Prompt: ${analysisResult.tokenUsage.prompt_tokens} | Completion: ${analysisResult.tokenUsage.completion_tokens}`} arrow>
                                                 <span className="text-[10px] text-slate-400 dark:text-gray-500 font-mono mt-2 inline-block">
@@ -1356,6 +1656,26 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                                     t('aiAnalysis.setMigrationTarget')
                                                 )}
                                             </Button>
+                                        </div>
+                                    </div>
+
+                                    <div className="bg-white dark:bg-gray-800 px-4 py-3 rounded-xl border border-slate-200 dark:border-gray-600 shadow-sm flex flex-col gap-2">
+                                        <div className="flex items-center gap-2">
+                                            <MessageSquare size={16} className="text-slate-500 dark:text-gray-400" />
+                                            <span className="text-sm font-semibold text-slate-700 dark:text-gray-200">
+                                                {t('aiAnalysis.rawText')}
+                                            </span>
+                                        </div>
+                                        <div className="max-h-64 overflow-y-auto rounded-lg border border-slate-200 dark:border-gray-700 bg-slate-50 dark:bg-gray-700/40 p-3">
+                                            {latestAiRawText.trim() ? (
+                                                <pre className="text-[11px] leading-relaxed whitespace-pre-wrap break-words text-slate-600 dark:text-gray-300 font-mono">
+                                                    {latestAiRawText}
+                                                </pre>
+                                            ) : (
+                                                <p className="text-xs text-slate-400 dark:text-gray-500">
+                                                    {t('aiAnalysis.rawTextEmpty')}
+                                                </p>
+                                            )}
                                         </div>
                                     </div>
 
@@ -1637,7 +1957,7 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
 
                                 <div className="flex-1 min-w-0 overflow-auto">
                                     {analysisResult.suggestions.length > 0 ? (
-                                        <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 pr-2">
+                                        <div className={`grid grid-cols-1 xl:grid-cols-2 gap-3 pr-2 ${isDragSelecting ? 'select-none' : ''}`}>
                                             {analysisResult.suggestions
                                                 .filter(s => !deletedPaths.has(s.path) && !addedToSafeListPaths.has(s.path))
                                                 .filter(s => {
@@ -1662,6 +1982,9 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                                             onToggleAction={() => handleToggleAction(suggestion.path, actualAction)}
                                                             originalAction={suggestion.action}
                                                             onAddToSafeList={handleAddToSafeListClick}
+                                                            onSelectionDragStart={handleSelectionDragStart}
+                                                            onSelectionDragEnter={handleSelectionDragEnter}
+                                                            onSelectionDragEnd={handleSelectionDragEnd}
                                                         />
                                                     )
                                                 })}
@@ -1709,7 +2032,7 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                                         '&:hover': { bgcolor: 'primary.dark', color: '#1A1A1A' }
                                     }}
                                 >
-                                    {t('aiAnalysis.start')}
+                                    {aiAnalyzeActionLabel}
                                 </Button>
                             </div>
                         )
@@ -1760,6 +2083,81 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
             )}
 
             <Dialog
+                open={showAiSnapshotDecisionDialog}
+                onClose={handleAiSnapshotDecisionClose}
+                maxWidth="xs"
+                fullWidth
+                PaperProps={{ sx: { borderRadius: '16px' } }}
+            >
+                <DialogTitle sx={{ pb: 1.5 }}>
+                    <Typography variant="h6" component="span" sx={{ fontWeight: 700 }}>
+                        {t('snapshot.aiDecisionTitle')}
+                    </Typography>
+                </DialogTitle>
+                <DialogContent sx={{ pt: '8px !important' }}>
+                    <Typography variant="body2" sx={{ color: 'text.secondary', lineHeight: 1.6 }}>
+                        {t('snapshot.aiDecisionHint')}
+                    </Typography>
+                    {pendingAiSnapshotDecision && (
+                        <Typography variant="caption" sx={{ display: 'block', mt: 1, color: 'text.secondary' }}>
+                            {pendingAiSnapshotDecision.defaultAction === 'save'
+                                ? t('snapshot.aiDecisionDefaultSave')
+                                : t('snapshot.aiDecisionDefaultSkip')}
+                        </Typography>
+                    )}
+                    <FormControlLabel
+                        sx={{ mt: 1.5 }}
+                        control={
+                            <Checkbox
+                                checked={aiSnapshotDecisionRememberForSession}
+                                onChange={(_, checked) => setAiSnapshotDecisionRememberForSession(checked)}
+                                size="small"
+                            />
+                        }
+                        label={t('snapshot.aiDecisionDontShowAgain')}
+                    />
+                </DialogContent>
+                <DialogActions sx={{ px: 3, pb: 2.5, pt: 0.5 }}>
+                    <Button
+                        onClick={() => void handleAiSnapshotDecisionAction('skip')}
+                        disabled={aiSnapshotDecisionSaving}
+                        variant={pendingAiSnapshotDecision?.defaultAction === 'skip' ? 'contained' : 'text'}
+                        sx={{
+                            borderRadius: '10px',
+                            textTransform: 'none',
+                            ...(pendingAiSnapshotDecision?.defaultAction === 'skip'
+                                ? {
+                                    bgcolor: 'grey.300',
+                                    color: 'text.primary',
+                                    '&:hover': { bgcolor: 'grey.400' },
+                                }
+                                : {}),
+                        }}
+                    >
+                        {t('snapshot.aiDecisionSkip')}
+                    </Button>
+                    <Button
+                        onClick={() => void handleAiSnapshotDecisionAction('save')}
+                        variant={pendingAiSnapshotDecision?.defaultAction === 'save' ? 'contained' : 'outlined'}
+                        disabled={aiSnapshotDecisionSaving || !pendingAiSnapshotDecision?.path.trim()}
+                        sx={{
+                            borderRadius: '10px',
+                            textTransform: 'none',
+                            ...(pendingAiSnapshotDecision?.defaultAction === 'save'
+                                ? {
+                                    bgcolor: 'primary.main',
+                                    color: '#1A1A1A',
+                                    '&:hover': { bgcolor: 'primary.dark', color: '#1A1A1A' },
+                                }
+                                : {}),
+                        }}
+                    >
+                        {t('snapshot.aiDecisionSave')}
+                    </Button>
+                </DialogActions>
+            </Dialog>
+
+            <Dialog
                 open={showSaveDialog}
                 onClose={() => setShowSaveDialog(false)}
                 maxWidth="sm"
@@ -1769,7 +2167,7 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                 }}
             >
                 <DialogTitle sx={{ pb: 2 }}>
-                    <Typography variant="h6" sx={{ fontWeight: 700, display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <Typography variant="h6" component="span" sx={{ fontWeight: 700, display: 'flex', alignItems: 'center', gap: 1 }}>
                         <Save size={20} />
                         {t('snapshot.saveSnapshot')}
                     </Typography>
