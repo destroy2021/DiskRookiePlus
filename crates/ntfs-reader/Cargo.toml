@@ -1,0 +1,13 @@
+[package]
+name = "ntfs-reader"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[target.'cfg(windows)'.dependencies]
+ntfs_reader_real = { package = "ntfs-reader", version = "0.4.5" }

@@ -245,7 +245,7 @@ npx vite build           # 构建测试
 3. **Security Audit** - `cargo audit` 安全检查
 4. **Frontend** - TypeScript 类型检查、ESLint、构建测试
 
-**注意**: Linux CI 会将 `ntfs-reader` crate 替换为 stub，因为该 crate 仅支持 Windows。
+**注意**: `crates/ntfs-reader` 是本仓库的本地 crate（非 submodule），非 Windows 平台自动提供 stub 实现，Linux CI 无需替换。
 
 ### 发布流程 (`.github/workflows/release.yml`)
 

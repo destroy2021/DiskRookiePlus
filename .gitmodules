@@ -1,3 +1,0 @@
-[submodule "crates/ntfs-reader"]
-	path = crates/ntfs-reader
-	url = https://github.com/kikijiki/ntfs-reader.git
