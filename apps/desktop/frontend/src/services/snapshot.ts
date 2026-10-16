@@ -1,5 +1,6 @@
 import type { TreemapNode } from '../components/Treemap'
 import type { AnalysisResult } from './ai-analysis'
+import type { AnalysisSession } from '../components/ExpertMode.types'
 import { invoke } from '@tauri-apps/api/core'
 import { readJSON, writeJSON, deleteStorageFile, getStoragePath } from './storage'
 import { loadAppSettings, normalizeSnapshotSaveDir } from './settings'
@@ -50,6 +51,7 @@ export interface Snapshot {
   ai_prompt: string
   ai_raw_text: string
   ai_structured_result: AnalysisResult | null
+  sessions?: AnalysisSession[]
 }
 
 export interface SaveSnapshotInput {
@@ -60,6 +62,7 @@ export interface SaveSnapshotInput {
   ai_prompt?: string
   ai_raw_text?: string
   ai_structured_result?: AnalysisResult | null
+  sessions?: AnalysisSession[]
 }
 
 export interface SnapshotMetadata {
@@ -76,7 +79,7 @@ export interface SnapshotMetadata {
 
 const SNAPSHOTS_INDEX = 'snapshots/index.json'
 const LEGACY_SNAPSHOT_DIR = 'snapshots'
-const SNAPSHOT_SCHEMA_VERSION = 3
+const SNAPSHOT_SCHEMA_VERSION = 4
 const SNAPSHOT_LIMIT = 50
 const BROWSER_STORAGE_PREFIX = 'browser://'
 const SNAPSHOT_TRUNCATE_SUFFIX = '\n...[snapshot truncated for size]'
@@ -158,6 +161,7 @@ function normalizeSnapshot(raw: Partial<Snapshot> | null): Snapshot | null {
     ai_prompt: typeof raw.ai_prompt === 'string' ? raw.ai_prompt : '',
     ai_raw_text: typeof raw.ai_raw_text === 'string' ? raw.ai_raw_text : '',
     ai_structured_result: raw.ai_structured_result ?? null,
+    sessions: raw.sessions ?? undefined,
   }
 }
 
@@ -474,6 +478,7 @@ export async function saveSnapshot(snapshot: SaveSnapshotInput): Promise<Snapsho
     ai_prompt: snapshot.ai_prompt ?? '',
     ai_raw_text: snapshot.ai_raw_text ?? '',
     ai_structured_result: snapshot.ai_structured_result ?? null,
+    sessions: snapshot.sessions,
   }
 
   const metadata: SnapshotMetadata = {

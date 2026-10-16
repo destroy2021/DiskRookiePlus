@@ -663,6 +663,122 @@ pub fn scan_path(path: &str) -> Result<ScanResult, DiskAnalyzerError> {
     scan_path_with_progress(path, None::<&ProgressCbArc>, true, true).map(|(r, _)| r)
 }
 
+const DIR_TOP_N_DEFAULT: usize = 50;
+const DIR_TOP_FILES_DEFAULT: usize = 100;
+const DIR_EXT_STATS_DEFAULT: usize = 30;
+
+pub fn scan_directory_top_n(
+    path: &str,
+    top_n: Option<usize>,
+    top_files_n: Option<usize>,
+) -> Result<ai_disk_domain::DirectoryTopNResult, DiskAnalyzerError> {
+    let start = Instant::now();
+    let path_buf = normalize_path(path);
+
+    if !path_buf.exists() {
+        return Err(DiskAnalyzerError::InvalidPath(format!(
+            "路径不存在: {}",
+            path
+        )));
+    }
+
+    let path_buf = std::fs::canonicalize(&path_buf)
+        .map_err(|e| DiskAnalyzerError::InvalidPath(format!("无法解析路径: {}", e)))?;
+
+    if !path_buf.is_dir() {
+        return Err(DiskAnalyzerError::InvalidPath(format!(
+            "路径不是目录: {}",
+            path
+        )));
+    }
+
+    let name = path_buf
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+        .to_string();
+
+    let counter = AtomicU64::new(0);
+    let (root, file_count, _interrupted) = build_tree(
+        &path_buf,
+        &name,
+        0,
+        &counter,
+        None,
+        true,
+        None,
+    )?;
+    let root = root.unwrap_or_else(|| FileNode {
+        path: path_buf.display().to_string(),
+        name: name.clone(),
+        size: 0,
+        is_dir: true,
+        modified: None,
+        children: vec![],
+    });
+
+    let n = top_n.unwrap_or(DIR_TOP_N_DEFAULT);
+    let fn_n = top_files_n.unwrap_or(DIR_TOP_FILES_DEFAULT);
+
+    let (top_directories_full, _root_children, extension_stats_full) = build_scan_summaries(&root);
+
+    let top_directories: Vec<ai_disk_domain::SummaryEntry> = top_directories_full
+        .into_iter()
+        .take(n)
+        .collect();
+
+    let extension_stats: Vec<ai_disk_domain::ExtensionStat> = extension_stats_full
+        .into_iter()
+        .take(DIR_EXT_STATS_DEFAULT)
+        .collect();
+
+    let mut all_files: Vec<ai_disk_domain::TopFileEntry> = Vec::new();
+    collect_top_files(&root, &mut all_files);
+    all_files.sort_by(|a, b| b.size.cmp(&a.size));
+    all_files.truncate(fn_n);
+
+    let dir_count = count_directories(&root).saturating_sub(1);
+
+    let scan_time_ms = start.elapsed().as_millis() as u64;
+
+    Ok(ai_disk_domain::DirectoryTopNResult {
+        path: path_buf.display().to_string(),
+        name,
+        total_size: root.size,
+        file_count,
+        dir_count,
+        top_files: all_files,
+        top_directories,
+        extension_stats,
+        scan_time_ms,
+    })
+}
+
+fn collect_top_files(node: &FileNode, out: &mut Vec<ai_disk_domain::TopFileEntry>) {
+    if !node.is_dir {
+        out.push(ai_disk_domain::TopFileEntry {
+            path: node.path.clone(),
+            size: node.size,
+            modified: node.modified,
+        });
+        return;
+    }
+    for child in &node.children {
+        collect_top_files(child, out);
+    }
+}
+
+fn count_directories(node: &FileNode) -> u64 {
+    if !node.is_dir {
+        return 0;
+    }
+    let mut count: u64 = 1;
+    for child in &node.children {
+        count = count.saturating_add(count_directories(child));
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,6 +20,7 @@ export interface CleanupSuggestion {
   size: string
   updateTime: string
   message: string
+  _parentPath?: string
 }
 
 export interface AnalysisResult {
@@ -36,6 +37,10 @@ export interface AnalysisResult {
     completion_tokens: number
     total_tokens: number
   }
+}
+
+export interface AnalyzeWithAiOptions {
+  onRawText?: (text: string) => void
 }
 
 export interface SystemInfo {
@@ -126,6 +131,7 @@ export async function analyzeWithAI(
   diskSummary: string,
   onProgress?: (msg: string) => void,
   signal?: AbortSignal,
+  options?: AnalyzeWithAiOptions,
 ): Promise<AnalysisResult> {
   ensureNotAborted(signal)
 
@@ -255,6 +261,7 @@ Please carefully analyze the data and provide reasonable, safe suggestions. All 
   ]
   const promptText = messages.map((m) => `[${m.role}]\n${m.content}`).join('\n\n')
   let rawTextForRecovery = ''
+  let streamingState: StreamingCompletionState | null = null
 
   onProgress?.(i18n.t('aiAnalysis.calling'))
 
@@ -286,10 +293,44 @@ Please carefully analyze the data and provide reasonable, safe suggestions. All 
         tool_choice: 'auto',
         temperature: settings.temperature,
         max_tokens: settings.maxTokens,
+        stream: Boolean(options?.onRawText),
+        stream_options: options?.onRawText ? { include_usage: true } : undefined,
       }),
     })
 
     ensureNotAborted(signal)
+    if (options?.onRawText && response.body) {
+      streamingState = await readChatCompletionStream(response, signal, options.onRawText)
+      const rawText = buildStreamingRawText(streamingState)
+      rawTextForRecovery = rawText
+      ensureNotAborted(signal)
+      if (!response.ok) {
+        throw new Error(`AI 请求失败: ${response.status} - ${rawText}`)
+      }
+
+      const toolCall = streamingState.toolCalls.find((call) => call.name === 'output_suggestions')
+      if (toolCall?.arguments.trim()) {
+        onProgress?.(i18n.t('aiAnalysis.parsing'))
+
+        const parsed = parseSuggestionsFromArguments(toolCall.arguments)
+        return buildToolCallResult(parsed, {
+          promptText,
+          rawText,
+          tokenUsage: streamingState.tokenUsage,
+          interrupted: false,
+        })
+      }
+
+      const content = streamingState.assistantContent || ''
+      return {
+        suggestions: [],
+        summary: content || 'AI 未提供具体建议',
+        promptText,
+        rawText,
+        tokenUsage: streamingState.tokenUsage,
+      }
+    }
+
     const rawText = await response.text()
     rawTextForRecovery = rawText
     ensureNotAborted(signal)
@@ -337,6 +378,13 @@ Please carefully analyze the data and provide reasonable, safe suggestions. All 
     }
   } catch (error) {
     if (isAbortAnalysisError(error)) {
+      if (streamingState) {
+        const recoveredFromStream = tryBuildInterruptedResultFromStream(streamingState, promptText)
+        if (recoveredFromStream) {
+          console.info('AI 分析已中断，已保留流式输出中的部分结果')
+          return recoveredFromStream
+        }
+      }
       const recovered = tryBuildInterruptedResultFromRaw(rawTextForRecovery, promptText)
       if (recovered) {
         console.info('AI 分析已中断，已保留可验证的部分结果')
@@ -347,6 +395,162 @@ Please carefully analyze the data and provide reasonable, safe suggestions. All 
       console.error('AI 分析失败:', error)
     }
     throw error
+  }
+}
+
+interface StreamingToolCallState {
+  id?: string
+  name?: string
+  arguments: string
+}
+
+interface StreamingCompletionState {
+  assistantContent: string
+  toolCalls: StreamingToolCallState[]
+  tokenUsage?: AnalysisResult['tokenUsage']
+}
+
+async function readChatCompletionStream(
+  response: Response,
+  signal: AbortSignal | undefined,
+  onRawText: (text: string) => void,
+): Promise<StreamingCompletionState> {
+  const reader = response.body?.getReader()
+  if (!reader) {
+    return {
+      assistantContent: '',
+      toolCalls: [],
+    }
+  }
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+  const state: StreamingCompletionState = {
+    assistantContent: '',
+    toolCalls: [],
+  }
+
+  while (true) {
+    ensureNotAborted(signal)
+    const { done, value } = await reader.read()
+    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done })
+
+    let lineBreakIndex = buffer.indexOf('\n')
+    while (lineBreakIndex >= 0) {
+      const line = buffer.slice(0, lineBreakIndex).trim()
+      buffer = buffer.slice(lineBreakIndex + 1)
+      lineBreakIndex = buffer.indexOf('\n')
+
+      if (!line.startsWith('data: ')) continue
+      const data = line.slice(6).trim()
+      if (!data || data === '[DONE]') continue
+
+      try {
+        const parsed = JSON.parse(data) as {
+          choices?: Array<{
+            delta?: {
+              content?: string
+              tool_calls?: Array<{
+                index?: number
+                id?: string
+                function?: {
+                  name?: string
+                  arguments?: string
+                }
+              }>
+            }
+          }>
+          usage?: AnalysisResult['tokenUsage']
+        }
+
+        if (parsed.usage) {
+          state.tokenUsage = parsed.usage
+        }
+
+        const delta = parsed.choices?.[0]?.delta
+        if (!delta) continue
+
+        if (typeof delta.content === 'string' && delta.content.length > 0) {
+          state.assistantContent += delta.content
+          onRawText(buildStreamingRawText(state))
+        }
+
+        if (Array.isArray(delta.tool_calls)) {
+          for (const toolCallDelta of delta.tool_calls) {
+            const index = toolCallDelta.index ?? 0
+            const existing = state.toolCalls[index] ?? { arguments: '' }
+            state.toolCalls[index] = {
+              id: toolCallDelta.id ?? existing.id,
+              name: toolCallDelta.function?.name ?? existing.name,
+              arguments: existing.arguments + (toolCallDelta.function?.arguments ?? ''),
+            }
+          }
+          onRawText(buildStreamingRawText(state))
+        }
+      } catch {
+        // Ignore malformed stream events from non-standard providers.
+      }
+    }
+
+    if (done) {
+      break
+    }
+  }
+
+  onRawText(buildStreamingRawText(state))
+  return state
+}
+
+function buildStreamingRawText(state: StreamingCompletionState): string {
+  const sections: string[] = []
+  const content = state.assistantContent.trim()
+  if (content) {
+    sections.push(content)
+  }
+
+  const toolSections = state.toolCalls
+    .filter((call) => call.name || call.arguments.trim())
+    .map((call, index) => {
+      const header = `[tool ${index + 1}] ${call.name ?? 'unknown'}`
+      const body = call.arguments.trim()
+      return body ? `${header}\n${body}` : header
+    })
+
+  if (toolSections.length > 0) {
+    sections.push(toolSections.join('\n\n'))
+  }
+
+  return sections.join('\n\n')
+}
+
+function tryBuildInterruptedResultFromStream(
+  state: StreamingCompletionState,
+  promptText: string,
+): AnalysisResult | null {
+  const rawText = buildStreamingRawText(state)
+  if (!rawText.trim()) return null
+
+  const toolCall = state.toolCalls.find((call) => call.name === 'output_suggestions')
+  if (toolCall?.arguments.trim()) {
+    const parsed = parseSuggestionsFromArguments(toolCall.arguments)
+    return buildToolCallResult(parsed, {
+      promptText,
+      rawText,
+      tokenUsage: state.tokenUsage,
+      interrupted: true,
+    })
+  }
+
+  if (!state.assistantContent.trim()) return null
+  return {
+    suggestions: [],
+    summary: i18n.t('aiAnalysis.canceled'),
+    promptText,
+    rawText,
+    tokenUsage: state.tokenUsage,
+    interrupted: true,
+    partial: true,
+    continueContextHint: i18n.t('aiAnalysis.continueFromContextHint'),
   }
 }
 
@@ -597,8 +801,88 @@ export async function deleteItem(path: string): Promise<void> {
   }
 }
 
+// 移到回收站
+export async function trashItem(path: string): Promise<void> {
+  try {
+    await invoke('trash_item', { path })
+  } catch (error) {
+    throw new Error(`移到回收站失败: ${error}`)
+  }
+}
+
 // 预留：迁移文件/目录（后续接入网盘）
 export async function moveItem(_path: string, _destination: string): Promise<void> {
   // TODO: 实现迁移逻辑
   throw new Error('迁移功能正在开发中，敬请期待')
+}
+
+export interface DirectoryTopNResult {
+  path: string
+  name: string
+  total_size: number
+  file_count: number
+  dir_count: number
+  top_files: { path: string; size: number; modified?: number | null }[]
+  top_directories: { path: string; name: string; size: number; file_count?: number | null; dir_count?: number | null; is_dir: boolean }[]
+  extension_stats: { ext: string; size: number; count: number }[]
+  scan_time_ms: number
+}
+
+export async function scanDirectoryTopN(
+  path: string,
+  topN?: number,
+  topFilesN?: number,
+): Promise<DirectoryTopNResult> {
+  return invoke<DirectoryTopNResult>('scan_directory_top_n_command', {
+    path,
+    topN,
+    topFilesN,
+  })
+}
+
+export interface DirEntry {
+  name: string
+  path: string
+  size: number
+  is_dir: boolean
+  modified?: number | null
+  child_count?: number | null
+}
+
+export interface DirectoryListing {
+  path: string
+  name: string
+  items: DirEntry[]
+  truncated: boolean
+  total_count?: number | null
+}
+
+export async function listDirectory(path: string): Promise<DirectoryListing> {
+  return invoke<DirectoryListing>('list_directory_command', { path })
+}
+
+export interface DirectorySizeResult {
+  path: string
+  total_size: number
+  file_count: number
+  dir_count: number
+  timed_out: boolean
+}
+
+export async function getDirectorySize(path: string): Promise<DirectorySizeResult> {
+  return invoke<DirectorySizeResult>('get_directory_size_command', { path })
+}
+
+export interface FileInfoResult {
+  path: string
+  name: string
+  size: number
+  modified?: number | null
+  is_dir: boolean
+  extension?: string | null
+  child_count?: number | null
+}
+
+export async function getFileInfo(path: string): Promise<FileInfoResult> {
+  return invoke<FileInfoResult>('get_file_info_command', { path })
 }

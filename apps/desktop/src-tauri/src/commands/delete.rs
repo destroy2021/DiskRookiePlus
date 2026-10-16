@@ -56,3 +56,49 @@ pub async fn delete_item(path: String) -> Result<String, String> {
         Ok(format!("已删除文件: {}", path))
     }
 }
+
+#[tauri::command]
+pub async fn trash_item(path: String) -> Result<String, String> {
+    log::info!("移到回收站请求: {}", path);
+    let path_buf = Path::new(&path);
+
+    if !path_buf.exists() {
+        log::error!("移到回收站失败，路径不存在: {}", path);
+        return Err(format!("路径不存在: {}", path));
+    }
+
+    // 安全检查：禁止操作系统关键目录
+    let forbidden_paths = if cfg!(windows) {
+        vec![
+            "C:\\Windows",
+            "C:\\Program Files",
+            "C:\\Program Files (x86)",
+            "C:\\System Volume Information",
+        ]
+    } else {
+        vec![
+            "/System", "/Library", "/bin", "/sbin", "/usr", "/etc", "/var",
+        ]
+    };
+
+    let canonical = fs::canonicalize(path_buf).map_err(|e| {
+        log::error!("移到回收站失败，无法解析路径: {}, error: {}", path, e);
+        format!("无法解析路径: {}", e)
+    })?;
+
+    let canonical_str = canonical.to_string_lossy().to_string();
+
+    for forbidden in forbidden_paths {
+        if canonical_str.starts_with(forbidden) {
+            log::warn!("拦截移到回收站系统目录: {}", forbidden);
+            return Err(format!("禁止操作系统目录: {}", forbidden));
+        }
+    }
+
+    trash::delete(path_buf).map_err(|e| {
+        log::error!("移到回收站失败: {}, error: {}", path, e);
+        format!("移到回收站失败: {}", e)
+    })?;
+    log::info!("移到回收站成功: {}", path);
+    Ok(format!("已移到回收站: {}", path))
+}

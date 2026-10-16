@@ -30,6 +30,7 @@ pub fn run() {
             commands::execute::execute_plan,
             commands::permission::check_admin_permission,
             commands::delete::delete_item,
+            commands::delete::trash_item,
             commands::storage::read_storage_file,
             commands::storage::write_storage_file,
             commands::storage::delete_storage_file,
@@ -65,6 +66,10 @@ pub fn run() {
             commands::kimi_oauth::kimi_code_request_device,
             commands::kimi_oauth::kimi_code_poll_token,
             commands::logging::log_frontend_event,
+            commands::drill_down::scan_directory_top_n_command,
+            commands::list_directory::list_directory_command,
+            commands::list_directory::get_directory_size_command,
+            commands::list_directory::get_file_info_command,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|err| {

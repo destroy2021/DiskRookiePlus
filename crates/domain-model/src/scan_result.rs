@@ -3,6 +3,20 @@ use serde::{Deserialize, Serialize};
 use crate::FileNode;
 use crate::TopFileEntry;
 
+/// 目录级下钻查询结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectoryTopNResult {
+    pub path: String,
+    pub name: String,
+    pub total_size: u64,
+    pub file_count: u64,
+    pub dir_count: u64,
+    pub top_files: Vec<TopFileEntry>,
+    pub top_directories: Vec<SummaryEntry>,
+    pub extension_stats: Vec<ExtensionStat>,
+    pub scan_time_ms: u64,
+}
+
 /// 目录/文件聚合摘要条目
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SummaryEntry {
@@ -55,6 +69,31 @@ pub struct ScanResult {
     /// 扩展名聚合统计（为空时不序列化）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extension_stats: Vec<ExtensionStat>,
+}
+
+/// 非递归目录列表结果（仅直接子项）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectoryListing {
+    pub path: String,
+    pub name: String,
+    pub items: Vec<DirEntry>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_count: Option<u64>,
+}
+
+/// 目录直接子项条目
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub is_dir: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_count: Option<u64>,
 }
 
 #[cfg(test)]

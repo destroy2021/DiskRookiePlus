@@ -4,13 +4,14 @@ use std::path::Path;
 use std::process::Command;
 
 #[tauri::command]
-pub async fn open_in_file_manager(path: String, is_file: bool) -> Result<(), String> {
-    log::info!("打开文件管理器请求, path: {}, is_file: {}", path, is_file);
+pub async fn open_in_file_manager(path: String, is_file: Option<bool>) -> Result<(), String> {
+    log::info!("打开文件管理器请求, path: {}, is_file: {:?}", path, is_file);
     let path_buf = Path::new(&path);
     if !path_buf.exists() {
         log::error!("打开文件管理器失败，路径不存在: {}", path);
         return Err(format!("路径不存在: {}", path));
     }
+    let is_file = is_file.unwrap_or_else(|| path_buf.is_file());
 
     #[cfg(windows)]
     {
@@ -21,7 +22,7 @@ pub async fn open_in_file_manager(path: String, is_file: bool) -> Result<(), Str
         let path_str = path_abs.to_string_lossy();
         if is_file {
             // 打开资源管理器并选中该文件（格式: /select,"path"）
-            let arg = format!("/select,\"{}\"", path_str.replace('"', "\\\""));
+            let arg = format!("/select,{}", path_str);
             Command::new("explorer").arg(arg).spawn().map_err(|e| {
                 log::error!("打开资源管理器失败: {}", e);
                 format!("无法打开资源管理器: {}", e)

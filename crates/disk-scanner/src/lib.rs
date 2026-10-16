@@ -13,7 +13,7 @@ pub use filters::*;
 pub use node::*;
 pub use scanner::{
     scan_path, scan_path_with_progress, scan_path_with_progress_and_cancel, scan_will_use_mft,
-    CancelFlagArc,
+    scan_directory_top_n, CancelFlagArc,
 };
 
 pub use ai_disk_domain::TopFileEntry;
