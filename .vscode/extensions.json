@@ -1,0 +1,12 @@
+{
+  "recommendations": [
+    // Rust 后端
+    "rust-lang.rust-analyzer",
+    // 调试 Rust：lldb 全平台，cppvsdbg 走 C/C++ 扩展
+    "vadimcn.vscode-lldb",
+    "ms-vscode.cpptools",
+    // 前端
+    "dbaeumer.vscode-eslint",
+    "bradlc.vscode-tailwindcss"
+  ]
+}

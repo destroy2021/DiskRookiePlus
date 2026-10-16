@@ -1,0 +1,123 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "install:frontend",
+      "type": "shell",
+      "command": "npm",
+      "args": ["install"],
+      "options": { "cwd": "${workspaceFolder}/apps/desktop/frontend" },
+      "problemMatcher": []
+    },
+    {
+      "label": "install:desktop",
+      "type": "shell",
+      "command": "npm",
+      "args": ["install"],
+      "options": { "cwd": "${workspaceFolder}/apps/desktop" },
+      "problemMatcher": []
+    },
+    {
+      // tauri.conf.json 的 beforeDevCommand 等价物（npm run frontend:dev）
+      "label": "frontend:dev",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "dev"],
+      "options": { "cwd": "${workspaceFolder}/apps/desktop/frontend" },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "vite",
+        "pattern": { "regexp": "^$" },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "> vite",
+          "endsPattern": "ready in|Local:"
+        }
+      }
+    },
+    {
+      // 构建前端产物，供 release 调试和 release 打包使用
+      "label": "ui:build",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "build"],
+      "options": { "cwd": "${workspaceFolder}/apps/desktop/frontend" },
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      // cppvsdbg 用：先编译出 exe，再由 launch.json 启动
+      "label": "build:desktop-debug",
+      "type": "cargo",
+      "command": "build",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      // 直接调试 exe 的准备动作：并行跑 cargo build 和 Vite。
+      // 缺一不可 —— debug 版 exe 是 dev 构建，窗口加载 http://localhost:5173，
+      // 没有 Vite 就是一个白窗口。
+      "label": "debug:exe",
+      "dependsOn": ["build:desktop-debug", "frontend:dev"],
+      "problemMatcher": []
+    },
+    {
+      "label": "check:rust",
+      "type": "cargo",
+      "command": "check",
+      "args": ["--workspace", "--all-targets"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "clippy:rust",
+      "type": "cargo",
+      "command": "clippy",
+      "args": ["--workspace", "--all-targets", "--", "-D", "warnings"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "lint:frontend",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "lint"],
+      "options": { "cwd": "${workspaceFolder}/apps/desktop/frontend" },
+      "problemMatcher": ["$eslint-stylish"]
+    },
+    {
+      "label": "typecheck:frontend",
+      "type": "shell",
+      "command": "npx",
+      "args": ["tsc", "-b", "--noEmit"],
+      "options": { "cwd": "${workspaceFolder}/apps/desktop/frontend" },
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      // 一条命令起完整应用（Rust + 前端热重载），Ctrl+C 结束。
+      // 应用要求管理员权限：请在“以管理员身份运行”的 VS Code 里执行，
+      // 或直接用 dev:launcher / scripts\dev.bat（会自己提权）。
+      "label": "dev:app",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "dev"],
+      "options": { "cwd": "${workspaceFolder}/apps/desktop" },
+      "problemMatcher": []
+    },
+    {
+      // 和 scripts/dev.bat 等价，额外做依赖自检
+      "label": "dev:launcher",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/dev.bat",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      // 和 scripts/build-release.bat 等价，产物落在 release-artifacts\
+      "label": "release:build",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/build-release.bat",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ]
+}

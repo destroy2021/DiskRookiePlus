@@ -1,0 +1,58 @@
+{
+  // DiskRookie 调试配置。Rust 断点用 lldb（全平台）或 cppvsdbg（Windows）。
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // 只调试前端：在浏览器里打开 http://localhost:5173
+      "name": "Frontend: Vite Dev (Chrome)",
+      "type": "chrome",
+      "request": "launch",
+      "url": "http://localhost:5173",
+      "webRoot": "${workspaceFolder}/apps/desktop/frontend/src",
+      "preLaunchTask": "frontend:dev"
+    },
+    {
+      // Windows 上用 Visual Studio 调试器，通常比 lldb 更快。
+      // 注意：应用清单要求管理员权限，VS Code 必须以管理员身份运行，
+      // 否则启动会因为 os error 740 失败。
+      "name": "Tauri: Rust Debug (MSVC, Windows)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/ai-disk-desktop.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "debug:exe",
+      "presentation": {
+        "hidden": false
+      }
+    },
+    {
+      // CodeLLDB 直接启动已编译的 exe，用 codelldb 自带的 lldb 打 Rust 断点。
+      // 同样要求 VS Code 以管理员身份运行：exe 清单是 requireAdministrator，
+      // 非管理员启动会直接报 “requires elevation” / os error 740。
+      "name": "Tauri: Rust Debug (exe, lldb)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/ai-disk-desktop.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": ["rust"],
+      "preLaunchTask": "debug:exe"
+    },
+    {
+      // 调试 release 版 Rust 后端（可命中优化前的代码）
+      "name": "Tauri: Rust Debug (release, lldb)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--release",
+          "--manifest-path=${workspaceFolder}/apps/desktop/src-tauri/Cargo.toml"
+        ]
+      },
+      "preLaunchTask": "ui:build",
+      "sourceLanguages": ["rust"]
+    }
+  ]
+}

@@ -1,1 +1,25 @@
-{}
+{
+  "rust-analyzer.linkedProjects": ["Cargo.toml"],
+  "rust-analyzer.cargo.allTargets": true,
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.extraArgs": ["--workspace", "--all-targets", "--", "-D", "warnings"],
+
+  "typescript.tsdk": "apps/desktop/frontend/node_modules/typescript/lib",
+  "eslint.workingDirectories": [{ "directory": "apps/desktop/frontend", "changeProcessCWD": true }],
+
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/node_modules/**": true,
+    "**/frontend/dist/**": true,
+    "**/release-artifacts/**": true
+  },
+  "search.exclude": {
+    "**/target": true,
+    "**/node_modules": true,
+    "**/frontend/dist": true,
+    "**/package-lock.json": true
+  },
+  "[rust]": { "editor.defaultFormatter": "rust-lang.rust-analyzer" },
+  "[typescript]": { "editor.defaultFormatter": "vscode.typescript-language-features" },
+  "[typescriptreact]": { "editor.defaultFormatter": "vscode.typescript-language-features" }
+}

@@ -9,6 +9,9 @@ node_modules/
 apps/desktop/frontend/dist/
 apps/desktop/src-tauri/gen/
 
+# 本地打包产物（scripts/build-release.bat 输出）
+/release-artifacts/
+
 # 系统
 .DS_Store
 Thumbs.db
