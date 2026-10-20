@@ -24,6 +24,8 @@ export interface AISettings {
   model: string
   temperature: number
   maxTokens: number
+  /** Top P 采样阈值；1（默认）表示不启用，不随请求发送 */
+  topP?: number
 }
 
 export interface ChatMessage {
@@ -79,6 +81,7 @@ export const DEFAULT_SETTINGS: AISettings = {
   model: 'gpt-4o-mini',
   temperature: 0,
   maxTokens: 2048,
+  topP: 1,
 }
 
 // 常见模型预设
@@ -232,6 +235,8 @@ export async function sendChatRequest(
     messages,
     temperature: settings.temperature,
     max_tokens: settings.maxTokens,
+    // topP 为 1 时是 OpenAI 的默认行为，不发送以避免部分网关不识别该字段
+    ...(settings.topP != null && settings.topP < 1 ? { top_p: settings.topP } : {}),
     stream: !!onStream,
   }
 
@@ -311,23 +316,32 @@ export interface ModelsListResponse {
   data: ModelInfo[]
 }
 
-export async function fetchAvailableModels(apiUrl: string, apiKey: string): Promise<ModelInfo[]> {
-  if (!apiKey || !apiUrl) {
-    return []
+/**
+ * 拉取模型列表并保留失败原因，供设置页「获取模型」按钮回显；
+ * 成功时 error 为 null。
+ */
+export async function fetchModelsWithReason(
+  apiUrl: string,
+  apiKey: string
+): Promise<{ models: ModelInfo[]; error: string | null }> {
+  if (!apiUrl?.trim()) {
+    return { models: [], error: '请先填写 API 地址' }
+  }
+  if (!apiKey) {
+    return { models: [], error: '请先填写 API Key，或完成 Kimi Code 登录' }
+  }
+  // Anthropic 不支持 models 端点
+  if (apiUrl.includes('anthropic')) {
+    return { models: [], error: 'Anthropic 端点不提供模型列表，请手动填写模型名称' }
   }
 
   try {
     const url = `${apiUrl.replace(/\/$/, '')}/models`
-    
+
     const headers: Record<string, string> = {
       Authorization: bearerAuthorization(apiKey),
     }
     applyKimiCodingAgentHeaders(headers, apiUrl)
-
-    // Anthropic 不支持 models 端点，返回空数组
-    if (apiUrl.includes('anthropic')) {
-      return []
-    }
 
     const response = await httpFetch(url, {
       method: 'GET',
@@ -335,15 +349,22 @@ export async function fetchAvailableModels(apiUrl: string, apiKey: string): Prom
     })
 
     if (!response.ok) {
-      console.error('Failed to fetch models:', response.status, response.statusText)
-      return []
+      const detail = await response.text().catch(() => '')
+      return {
+        models: [],
+        error: `HTTP ${response.status} ${response.statusText}${detail ? ` - ${detail.slice(0, 200)}` : ''}`,
+      }
     }
 
     const data = await response.json() as ModelsListResponse
-    return data.data || []
+    const models = data.data || []
+    if (models.length === 0) {
+      return { models, error: '该端点返回了空模型列表' }
+    }
+    return { models, error: null }
   } catch (error) {
-    console.error('Error fetching models:', error)
-    return []
+    const message = error instanceof Error ? error.message : String(error)
+    return { models: [], error: message }
   }
 }
 
@@ -384,6 +405,24 @@ export async function testConnection(settings: AISettings): Promise<{ ok: boolea
     const message = err instanceof Error ? err.message : String(err)
     return { ok: false, message }
   }
+}
+
+/**
+ * 测试模型可用性：向所选模型发一次极短推理，确认能拿到非空回复。
+ * 与 testConnection 的区别仅在语义与提示文案（这里是「模型是否可用」），
+ * 请求链路完全复用，避免两套鉴权逻辑漂移。
+ */
+export async function testModel(settings: AISettings): Promise<{ ok: boolean; message: string }> {
+  if (!settings.apiUrl?.trim()) {
+    return { ok: false, message: '请先填写 API 地址' }
+  }
+  if (!settings.model?.trim()) {
+    return { ok: false, message: '请先选择或填写模型' }
+  }
+  const result = await testConnection(settings)
+  return result.ok
+    ? { ok: true, message: `模型 ${settings.model} 可用：${result.message}` }
+    : result
 }
 
 // 系统提示词

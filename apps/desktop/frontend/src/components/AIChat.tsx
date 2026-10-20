@@ -3,9 +3,9 @@ import { Send, Loader2, Trash2, AlertCircle } from 'lucide-react'
 import { IconButton, TextField, Alert, Box } from '@mui/material'
 import {
   loadSettings,
+  loadSystemPrompt,
   resolveEffectiveApiKey,
   sendChatRequest,
-  SYSTEM_PROMPT,
   type ChatMessage,
 } from '../services/ai'
 
@@ -64,9 +64,9 @@ export function AIChat() {
     setError(null)
     setIsLoading(true)
 
-    // 准备发送给 API 的消息
+    // 准备发送给 API 的消息（系统提示词优先取用户在设置中自定义的内容）
     const apiMessages: ChatMessage[] = [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: await loadSystemPrompt() },
       ...messages.map(m => ({ role: m.role, content: m.content })),
       { role: 'user', content: userMessage.content },
     ]

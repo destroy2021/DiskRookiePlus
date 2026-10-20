@@ -271,6 +271,7 @@ Please carefully analyze the data and provide reasonable, safe suggestions. All 
         tool_choice: 'auto',
         temperature: settings.temperature,
         max_tokens: settings.maxTokens,
+        ...(settings.topP != null && settings.topP < 1 ? { top_p: settings.topP } : {}),
       }),
     })
 

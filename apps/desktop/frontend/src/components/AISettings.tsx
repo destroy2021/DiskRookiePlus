@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
-import { X, Eye, EyeOff, Check, AlertCircle, ChevronDown, ChevronUp, Brain, Cloud, Settings, Wifi, Shield, Trash2, BookmarkPlus } from 'lucide-react'
+import { X, Eye, EyeOff, Check, AlertCircle, ChevronDown, ChevronUp, Brain, Cloud, Settings, Wifi, Shield, Trash2, BookmarkPlus, RefreshCw, FlaskConical, FileText } from 'lucide-react'
 import { showNotification } from '../services/notification'
 import {
   TextField,
@@ -39,8 +39,12 @@ import {
   MODEL_PRESETS,
   API_URL_PRESETS,
   getPresetId,
-  fetchAvailableModels,
+  fetchModelsWithReason,
   testConnection,
+  testModel,
+  loadSystemPrompt,
+  saveSystemPrompt,
+  SYSTEM_PROMPT,
   resolveEffectiveApiKey,
   type AISettings as AISettingsType,
   type ModelInfo,
@@ -112,10 +116,18 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
   const [loadingModels, setLoadingModels] = useState(false)
   const [testingConnection, setTestingConnection] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null)
+  const [fetchingModels, setFetchingModels] = useState(false)
+  const [testingModel, setTestingModel] = useState(false)
+  const [modelFetchMsg, setModelFetchMsg] = useState<{ ok: boolean; message: string } | null>(null)
+  const [modelTestMsg, setModelTestMsg] = useState<{ ok: boolean; message: string } | null>(null)
+  // 用户点「获取模型」成功过一次后置位：自动拉取失败（或返回空）时不再覆盖手动结果
+  const manualFetchedRef = useRef(false)
   const [advancedExpanded, setAdvancedExpanded] = useState(false)
   const [modelSelectOpen, setModelSelectOpen] = useState(false)
   const [activeTab, setActiveTab] = useState(initialTab)
   const [showSafeListDialog, setShowSafeListDialog] = useState(false)
+  const [showPromptDialog, setShowPromptDialog] = useState(false)
+  const [systemPromptDraft, setSystemPromptDraft] = useState('')
   const [customApiPresets, setCustomApiPresets] = useState<CustomApiPresetItem[]>([])
   const [showSavePresetDialog, setShowSavePresetDialog] = useState(false)
   const [savePresetName, setSavePresetName] = useState('')
@@ -200,16 +212,19 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
       if (effective && settings.apiUrl) {
         setLoadingModels(true)
         try {
-          const models = await fetchAvailableModels(settings.apiUrl, effective)
-          if (!cancelled) setAvailableModels(models)
-        } catch (error) {
-          console.error('Failed to load models:', error)
-          if (!cancelled) setAvailableModels([])
+          const { models, error } = await fetchModelsWithReason(settings.apiUrl, effective)
+          if (cancelled) return
+          if (error) {
+            // 手动拉取过有效列表时，自动拉取的失败不覆盖它
+            if (!manualFetchedRef.current) setAvailableModels([])
+          } else {
+            setAvailableModels(models)
+          }
         } finally {
           if (!cancelled) setLoadingModels(false)
         }
       } else {
-        setAvailableModels([])
+        if (!manualFetchedRef.current) setAvailableModels([])
       }
     }
 
@@ -253,6 +268,10 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
   }
 
   const handleUrlChange = (value: string) => {
+    // 换了厂商：手动拉取的模型列表不再代表当前端点，取消保护
+    manualFetchedRef.current = false
+    setModelFetchMsg(null)
+    setModelTestMsg(null)
     if (value === 'custom') {
       setSettings(s => ({ ...s, apiUrl: customUrl || '' }))
     } else {
@@ -268,6 +287,7 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
   }
 
   const handleModelChange = (value: string) => {
+    setModelTestMsg(null)
     if (value === 'custom') {
       setSettings(s => ({ ...s, model: customModel || '' }))
     } else {
@@ -403,7 +423,13 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                       fullWidth
                       size="small"
                       value={settings.apiUrl}
-                      onChange={(e) => setSettings(s => ({ ...s, apiUrl: e.target.value }))}
+                      onChange={(e) => {
+                        // 手改地址同样换了端点，取消手动列表保护
+                        manualFetchedRef.current = false
+                        setModelFetchMsg(null)
+                        setModelTestMsg(null)
+                        setSettings(s => ({ ...s, apiUrl: e.target.value }))
+                      }}
                       placeholder={t('settings.inputCustomApiUrl')}
                       sx={{ fontSize: '14px' }}
                     />
@@ -705,6 +731,75 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                       sx={{ fontSize: '14px' }}
                     />
                   )}
+
+                  {/* 模型操作：显式拉取列表 + 实测所选模型 */}
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap', mt: 0.5 }}>
+                    <Button
+                      variant="outlined"
+                      size="small"
+                      startIcon={fetchingModels ? <CircularProgress size={16} /> : <RefreshCw className="w-4 h-4" />}
+                      disabled={fetchingModels || !hasCredential || !settings.apiUrl}
+                      onClick={async () => {
+                        setModelFetchMsg(null)
+                        setFetchingModels(true)
+                        try {
+                          const effective = await resolveEffectiveApiKey(settings)
+                          const { models, error } = await fetchModelsWithReason(settings.apiUrl, effective)
+                          setAvailableModels(models)
+                          if (error) {
+                            setModelFetchMsg({ ok: false, message: error })
+                          } else {
+                            manualFetchedRef.current = true
+                            setModelFetchMsg({ ok: true, message: t('settings.fetchModelsOk', { count: models.length }) })
+                            if (models.length > 0 && !models.some((m) => m.id === settings.model)) {
+                              setSettings((s) => ({ ...s, model: models[0].id }))
+                            }
+                          }
+                        } finally {
+                          setFetchingModels(false)
+                        }
+                      }}
+                      sx={{ textTransform: 'none' }}
+                    >
+                      {fetchingModels ? t('settings.fetchModelsLoading') : t('settings.fetchModels')}
+                    </Button>
+                    <Button
+                      variant="outlined"
+                      size="small"
+                      startIcon={testingModel ? <CircularProgress size={16} /> : <FlaskConical className="w-4 h-4" />}
+                      disabled={testingModel || !hasCredential || !settings.model}
+                      onClick={async () => {
+                        setModelTestMsg(null)
+                        setTestingModel(true)
+                        try {
+                          const result = await testModel(settings)
+                          setModelTestMsg(result)
+                        } finally {
+                          setTestingModel(false)
+                        }
+                      }}
+                      sx={{ textTransform: 'none' }}
+                    >
+                      {testingModel ? t('settings.testModelTesting') : t('settings.testModel')}
+                    </Button>
+                  </Box>
+                  {/* 失败信息就地展示（不弹通知），便于对照 URL/Key/模型逐项排查 */}
+                  {modelFetchMsg != null && (
+                    <Typography
+                      variant="body2"
+                      sx={{ color: modelFetchMsg.ok ? 'success.main' : 'error.main', fontSize: '12px', wordBreak: 'break-word' }}
+                    >
+                      {modelFetchMsg.message}
+                    </Typography>
+                  )}
+                  {modelTestMsg != null && (
+                    <Typography
+                      variant="body2"
+                      sx={{ color: modelTestMsg.ok ? 'success.main' : 'error.main', fontSize: '12px', wordBreak: 'break-word' }}
+                    >
+                      {modelTestMsg.message}
+                    </Typography>
+                  )}
                 </Box>
               )}
 
@@ -802,6 +897,51 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
                       />
                       <FormHelperText sx={{ fontSize: '10px', m: 0 }}>
                         {t('settings.promptFileCountHint')}
+                      </FormHelperText>
+                    </Box>
+
+                    {/* Top P（为 1 时不随请求发送，等于关闭） */}
+                    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <Typography variant="body2" sx={{ color: 'text.primary' }}>{t('settings.topP')}</Typography>
+                        <Typography variant="body2" sx={{ color: 'text.secondary', fontVariantNumeric: 'tabular-nums' }}>
+                          {(settings.topP ?? 1).toFixed(2)}
+                        </Typography>
+                      </Box>
+                      <Slider
+                        min={0.1}
+                        max={1}
+                        step={0.05}
+                        value={settings.topP ?? 1}
+                        onChange={(_, value) => setSettings(s => ({ ...s, topP: value as number }))}
+                        sx={{ color: 'primary.main' }}
+                        marks={[
+                          { value: 0.1, label: '0.1' },
+                          { value: 1, label: '1' },
+                        ]}
+                      />
+                      <FormHelperText sx={{ fontSize: '10px', m: 0 }}>
+                        {t('settings.topPHint')}
+                      </FormHelperText>
+                    </Box>
+
+                    {/* 系统提示词 */}
+                    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                      <Typography variant="body2" sx={{ color: 'text.primary' }}>{t('settings.systemPrompt')}</Typography>
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        startIcon={<FileText size={16} />}
+                        onClick={async () => {
+                          setSystemPromptDraft(await loadSystemPrompt())
+                          setShowPromptDialog(true)
+                        }}
+                        sx={{ textTransform: 'none', alignSelf: 'flex-start' }}
+                      >
+                        {t('settings.editSystemPrompt')}
+                      </Button>
+                      <FormHelperText sx={{ fontSize: '10px', m: 0 }}>
+                        {t('settings.systemPromptHint')}
                       </FormHelperText>
                     </Box>
                   </Box>
@@ -1088,6 +1228,61 @@ export function AISettings({ onClose, initialTab = 0, onSaved, themePreference: 
           <DialogActions sx={{ px: 3, pb: 2 }}>
             <Button onClick={() => setShowSafeListDialog(false)} sx={{ borderRadius: '10px', textTransform: 'none' }}>
               {t('common.close')}
+            </Button>
+          </DialogActions>
+        </Dialog>
+
+        {/* 系统提示词编辑对话框 */}
+        <Dialog
+          open={showPromptDialog}
+          onClose={() => setShowPromptDialog(false)}
+          maxWidth="sm"
+          fullWidth
+          PaperProps={{ sx: { borderRadius: '16px' } }}
+        >
+          <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            <FileText size={20} />
+            {t('settings.systemPrompt')}
+          </DialogTitle>
+          <DialogContent>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+              {t('settings.systemPromptHint')}
+            </Typography>
+            <TextField
+              multiline
+              fullWidth
+              minRows={8}
+              maxRows={16}
+              value={systemPromptDraft}
+              onChange={(e) => setSystemPromptDraft(e.target.value)}
+              sx={{ '& .MuiOutlinedInput-root': { borderRadius: '10px', fontSize: '13px' } }}
+            />
+          </DialogContent>
+          <DialogActions sx={{ px: 3, pb: 2 }}>
+            <Button
+              onClick={() => setSystemPromptDraft(SYSTEM_PROMPT)}
+              sx={{ borderRadius: '10px', textTransform: 'none', mr: 'auto' }}
+            >
+              {t('settings.resetDefault')}
+            </Button>
+            <Button onClick={() => setShowPromptDialog(false)} sx={{ borderRadius: '10px', textTransform: 'none' }}>
+              {t('common.cancel')}
+            </Button>
+            <Button
+              variant="contained"
+              onClick={async () => {
+                try {
+                  await saveSystemPrompt(systemPromptDraft.trim())
+                  setShowPromptDialog(false)
+                  showNotification(t('settings.systemPromptSaved'), '')
+                  onSaved?.()
+                } catch (err) {
+                  showNotification(t('settings.saveFailed'), String(err))
+                }
+              }}
+              sx={{ borderRadius: '10px', textTransform: 'none' }}
+            >
+              {t('common.confirm')}
             </Button>
           </DialogActions>
         </Dialog>
