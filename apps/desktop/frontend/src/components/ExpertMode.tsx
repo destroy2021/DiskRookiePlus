@@ -12,34 +12,13 @@ import { formatBytes, formatDuration } from '../utils/format'
 import { loadSettings, resolveEffectiveApiKey } from '../services/ai'
 import { analyzeWithAI, deleteItem, type AnalysisResult } from '../services/ai-analysis'
 import { SuggestionCard } from './SuggestionCard'
-import { saveSnapshot, type Snapshot } from '../services/snapshot'
+import { saveSnapshot, type Snapshot, type ScanResult, type SnapshotAI } from '../services/snapshot'
 import { readStorageFile, writeStorageFile } from '../services/storage'
 import { loadAppSettings, saveAppSettings, getEnabledCloudStorageConfigs, CLOUD_STORAGE_PROVIDERS, type CloudStorageConfig } from '../services/settings'
 import { loadSafeListPaths, isPathInSafeList, addToSafeList } from '../services/safeList'
 import { CloudStorageSelector } from './CloudStorageSelector'
 import type { Task } from '../services/taskQueue'
 
-/** 按大小排序的前 N 大文件条目（MFT 扫描时由后端填充） */
-interface TopFileEntry {
-    path: string
-    size: number
-    modified?: number | null
-}
-
-interface ScanResult {
-    root: TreemapNode
-    scan_time_ms: number
-    file_count: number
-    total_size: number
-    /** 当 MFT 扫描失败并回退到普通扫描时，后端会设置此字段，前端用于标注「此磁盘的扫描有错误」 */
-    scan_warning?: string | null
-    /** 卷总容量（字节），由操作系统 API 获取 */
-    volume_total_bytes?: number | null
-    /** 卷剩余可用空间（字节） */
-    volume_free_bytes?: number | null
-    /** 按大小排序的前 N 大文件，供摘要与 AI 分析用，避免遍历整棵树 */
-    top_files?: TopFileEntry[] | null
-}
 
 const PROMPT_INSTRUCTION_FILE = 'prompt-instruction.txt'
 
@@ -357,9 +336,11 @@ export interface ExpertModeProps {
     onAddMigrateTask?: (sourcePath: string, fileSize: number, targetConfigs: CloudStorageConfig[], targetPath: string) => string
     onFileDeleted?: (callback: ((path: string) => void) | null) => void  // 设置文件删除通知回调
     tasks?: Task[]  // 任务队列，用于同步状态
+    /** 把当前扫描结果的保存函数注册给父组件，供快照管理弹窗直接保存 */
+    onSaveSnapshotReady?: (save: (() => void) | null) => void
 }
 
-export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, settingsSavedTrigger, onAddMigrateTask, onFileDeleted, tasks = [] }: ExpertModeProps) {
+export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, settingsSavedTrigger, onAddMigrateTask, onFileDeleted, tasks = [], onSaveSnapshotReady }: ExpertModeProps) {
     const { t } = useTranslation()
     const [path, setPath] = useState('')
     const [status, setStatus] = useState<'idle' | 'scanning' | 'done' | 'error'>('idle')
@@ -373,6 +354,14 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
     const [shallowDirs, setShallowDirs] = useState(true)
     const openedSettingsForStandardRef = useRef(false)
 
+    // 快照用的上下文：实际扫描参数、发给 AI 的 prompt 全文、模型名、分析完成时间
+    const lastUseMftRef = useRef(true)
+    const lastPromptFileCountRef = useRef<number | undefined>(undefined)
+    const lastPromptRef = useRef('')
+    const aiModelRef = useRef('')
+    const analysisResultAtRef = useRef(0)
+    // 已恢复的快照 id，避免 isAdmin 变化导致同一快照重复恢复
+    const restoredSnapshotIdRef = useRef<string | null>(null)
     // 标准模式 AI 分析状态
     const [aiAnalyzing, setAiAnalyzing] = useState(false)
     const [aiProgress, setAiProgress] = useState('')
@@ -425,9 +414,13 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         if (!targetPath) return
         const pathToScan = normalizeScanPath(targetPath)
         setStatus('scanning'); setErrorMsg(''); setResult(null); setProgressFiles(0); setProgressMessage(''); setAnalysisResult(null); setActionFilter('all'); setActionOverrides(new Map());
+        lastPromptRef.current = ''
+        analysisResultAtRef.current = 0
         try {
             const appSettings = await loadAppSettings()
             const useMft = appSettings.useMftScan !== false
+            lastUseMftRef.current = useMft
+            lastPromptFileCountRef.current = appSettings.promptFileCount
             const res = await invoke<ScanResult>('scan_path_command', { path: pathToScan, shallowDirs, useMft })
             setResult(res); setStatus('done');
 
@@ -441,7 +434,10 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                         throw new Error('请先在设置中配置 API Key，或完成 Kimi Code 登录')
                     }
                     const summary = await buildFileListSummary(res, appSettings.promptFileCount)
+                    lastPromptRef.current = summary
                     const aiResult = await analyzeWithAI(summary, (msg) => setAiProgress(msg))
+                    analysisResultAtRef.current = Date.now()
+                    aiModelRef.current = aiSettings.model
                     setAnalysisResult(aiResult)
                     // AI分析完成后显示系统通知（Windows右下角/macOS右上角）
                     const suggestionCount = aiResult.suggestions.length
@@ -721,14 +717,45 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         setShowSaveDialog(true)
     }, [result, path])
 
+    // 把「保存当前扫描」入口暴露给快照管理弹窗
+    useEffect(() => {
+        if (result && status === 'done') {
+            onSaveSnapshotReady?.(handleSaveSnapshot)
+        } else {
+            onSaveSnapshotReady?.(null)
+        }
+        return () => onSaveSnapshotReady?.(null)
+    }, [result, status, handleSaveSnapshot, onSaveSnapshotReady])
+
     const handleConfirmSaveSnapshot = useCallback(async () => {
         if (!result || !path || !snapshotName.trim()) return
+
+        // 完整快照：扫描结果 + 扫描参数 + AI 分析 + 界面状态，恢复后与一次重新扫描（含 AI）等价
+        const ai: SnapshotAI | null = analysisResult
+            ? {
+                summary: analysisResult.summary,
+                suggestions: analysisResult.suggestions,
+                tokenUsage: analysisResult.tokenUsage,
+                prompt: lastPromptRef.current || undefined,
+                model: aiModelRef.current || undefined,
+                analyzedAt: analysisResultAtRef.current || Date.now(),
+            }
+            : null
 
         try {
             await saveSnapshot({
                 name: snapshotName.trim(),
                 path,
+                mode: isAdmin ? 'developer' : 'standard',
                 scanResult: result,
+                scan: {
+                    shallowDirs,
+                    useMft: lastUseMftRef.current,
+                    promptFileCount: lastPromptFileCountRef.current,
+                },
+                ai,
+                deletedPaths: [...deletedPaths],
+                actionOverrides: [...actionOverrides],
             })
             setShowSaveDialog(false)
             setSnapshotName('')
@@ -736,8 +763,7 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         } catch (e) {
             showNotification(t('snapshot.saveFailed'), String(e))
         }
-    }, [result, path, snapshotName])
-
+    }, [result, path, snapshotName, analysisResult, isAdmin, shallowDirs, deletedPaths, actionOverrides])
     // 设置迁移目标
     const handleSetMigrationTarget = useCallback(async () => {
         const configs = await getEnabledCloudStorageConfigs()
@@ -763,27 +789,65 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
         }
     }, [])
 
-    // 加载快照
+    // 加载快照：完整还原到与「重新扫描一次 + AI 分析完成」一致的状态
     useEffect(() => {
-        if (!loadedSnapshot) return
+        if (!loadedSnapshot) {
+            // 已恢复并清空后重置，使同一快照可以再次加载
+            restoredSnapshotIdRef.current = null
+            return
+        }
+        // isAdmin 会改变本 effect 依赖，用 ref 保证一个快照只恢复一次
+        if (restoredSnapshotIdRef.current === loadedSnapshot.id) return
+        restoredSnapshotIdRef.current = loadedSnapshot.id
+        restoredSnapshotIdRef.current = loadedSnapshot.id
 
         setPath(loadedSnapshot.path)
         setResult(loadedSnapshot.scanResult)
         setStatus('done')
-        setAnalysisResult(null)
-        setDeletedPaths(new Set())
+        setErrorMsg('')
+        setDeletedPaths(new Set(loadedSnapshot.deletedPaths ?? []))
+        setSelectedItems(new Set())
         setActionFilter('all')
-        setActionOverrides(new Map())
+        setActionOverrides(new Map(loadedSnapshot.actionOverrides ?? []))
 
-        // 标准模式：加载快照后自动进行 AI 分析
-        if (isAdmin === false) {
+        // 恢复扫描参数，使恢复后的面板行为与那次扫描一致
+        const scan = loadedSnapshot.scan
+        if (scan) {
+            setShallowDirs(scan.shallowDirs)
+            lastUseMftRef.current = scan.useMft
+            lastPromptFileCountRef.current = scan.promptFileCount
+        }
+
+        // 恢复界面模式（标准 / 开发者）
+        if (loadedSnapshot.mode) {
+            setIsAdmin(loadedSnapshot.mode === 'developer')
+        }
+
+        const savedAI = loadedSnapshot.ai
+        if (savedAI) {
+            // 快照里已有 AI 结果：直接还原，不再花 token 重新分析
+            setAnalysisResult({
+                suggestions: savedAI.suggestions,
+                summary: savedAI.summary,
+                tokenUsage: savedAI.tokenUsage,
+            })
+            lastPromptRef.current = savedAI.prompt ?? ''
+            aiModelRef.current = savedAI.model ?? ''
+            analysisResultAtRef.current = savedAI.analyzedAt ?? 0
+            setAiAnalyzing(false)
+            setAiProgress('')
+        } else if (isAdmin === false) {
+            // 旧快照没有 AI 结果：保持原有行为，重新分析
+            setAnalysisResult(null)
             setAiAnalyzing(true)
             setAiProgress(t('aiAnalysis.preparing'))
 
             const runAIAnalysis = async () => {
                 try {
                     const summary = await buildFileListSummary(loadedSnapshot.scanResult)
+                    lastPromptRef.current = summary
                     const aiResult = await analyzeWithAI(summary, (msg) => setAiProgress(msg))
+                    analysisResultAtRef.current = Date.now()
                     setAnalysisResult(aiResult)
                 } catch (aiError) {
                     setErrorMsg(`${t('aiAnalysis.failed')}: ${aiError}`)

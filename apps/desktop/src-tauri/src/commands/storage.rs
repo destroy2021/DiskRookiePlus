@@ -1,5 +1,9 @@
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
@@ -81,6 +85,55 @@ pub async fn delete_storage_file(
         success: true,
         message: format!("文件已删除: {}", filename),
     })
+}
+
+/// 以 gzip 压缩写入文本文件（快照等大 JSON 用，重复键名压缩率通常 10 倍以上）
+#[tauri::command]
+pub async fn write_storage_file_gzip(
+    app: AppHandle,
+    filename: String,
+    content: String,
+) -> Result<u64, String> {
+    let file_path = get_storage_root(&app)?.join(&filename);
+
+    if let Some(parent) = file_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
+        }
+    }
+
+    let file =
+        fs::File::create(&file_path).map_err(|e| format!("创建文件失败 {}: {}", filename, e))?;
+    let mut encoder = GzEncoder::new(file, Compression::new(6));
+    encoder
+        .write_all(content.as_bytes())
+        .map_err(|e| format!("压缩写入失败 {}: {}", filename, e))?;
+    encoder
+        .finish()
+        .map_err(|e| format!("压缩完成失败 {}: {}", filename, e))?;
+    let written = fs::metadata(&file_path)
+        .map(|m| m.len())
+        .map_err(|e| format!("读取文件大小失败 {}: {}", filename, e))?;
+    Ok(written)
+}
+
+/// 读取 gzip 压缩的文本文件；文件不存在时返回空串
+#[tauri::command]
+pub async fn read_storage_file_gzip(app: AppHandle, filename: String) -> Result<String, String> {
+    let file_path = get_storage_root(&app)?.join(&filename);
+
+    if !file_path.exists() {
+        return Ok(String::new());
+    }
+
+    let file =
+        fs::File::open(&file_path).map_err(|e| format!("打开文件失败 {}: {}", filename, e))?;
+    let mut decoder = GzDecoder::new(file);
+    let mut out = String::new();
+    decoder
+        .read_to_string(&mut out)
+        .map_err(|e| format!("解压读取失败 {}: {}", filename, e))?;
+    Ok(out)
 }
 
 /// 列出目录中的文件

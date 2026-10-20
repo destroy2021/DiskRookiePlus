@@ -82,3 +82,28 @@ export async function writeJSON(filename: string, data: unknown): Promise<void> 
   const content = JSON.stringify(data, null, 2)
   await writeStorageFile(filename, content)
 }
+
+/**
+ * 以 gzip 写入存储文件（快照等大 JSON 用，重复键名压缩后体积通常降到 1/10 左右）
+ */
+export async function writeStorageFileGzip(filename: string, content: string): Promise<number> {
+  try {
+    // 后端返回压缩后的字节数，用于在快照列表中展示磁盘占用
+    return await invoke<number>('write_storage_file_gzip', { filename, content })
+  } catch (error) {
+    console.error(`写入 gzip 文件失败 ${filename}:`, error)
+    throw error
+  }
+}
+
+/**
+ * 读取 gzip 存储文件；文件不存在或解压失败返回空串
+ */
+export async function readStorageFileGzip(filename: string): Promise<string> {
+  try {
+    return await invoke<string>('read_storage_file_gzip', { filename })
+  } catch (error) {
+    console.error(`读取 gzip 文件失败 ${filename}:`, error)
+    return ''
+  }
+}

@@ -4,6 +4,12 @@ version = "0.2.3"
 edition = "2021"
 description = "AI Disk Analyzer - 智能磁盘分析工具"
 
+# GUI 主程序 requireAdministrator（MFT 扫描），cargo test 无法 spawn；它也没有单元测试。
+[[bin]]
+name = "ai-disk-desktop"
+path = "src/main.rs"
+test = false
+
 [lints]
 workspace = true
 
@@ -41,3 +47,4 @@ ai-disk-scanner = { path = "../../../crates/disk-scanner" }
 ai-disk-engine = { path = "../../../crates/ai-engine" }
 ai-disk-executor = { path = "../../../crates/executor" }
 tauri-plugin-http = { version = "2", features = ["unsafe-headers"] }
+flate2 = "1"

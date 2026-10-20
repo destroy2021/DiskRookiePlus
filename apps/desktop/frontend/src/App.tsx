@@ -42,6 +42,9 @@ function App() {
   const [tasks, setTasks] = useState<Task[]>([])
   const [isPaused, setIsPaused] = useState(false)
   const processingRef = useRef(false)
+  // 当前扫描结果的保存入口（由 ExpertMode 注册），供快照弹窗手动保存
+  const saveSnapshotRef = useRef<(() => void) | null>(null)
+  const [canSaveSnapshot, setCanSaveSnapshot] = useState(false)
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map())
 
   // 活跃任务数量
@@ -58,6 +61,12 @@ function App() {
   // 设置文件删除通知回调
   const setOnFileDeleted = useCallback((callback: ((path: string) => void) | null) => {
     onFileDeletedRef.current = callback
+  }, [])
+
+  // 注册当前扫描结果的保存入口（稳定引用，避免子组件 effect 反复重跑）
+  const handleSaveSnapshotReady = useCallback((save: (() => void) | null) => {
+    saveSnapshotRef.current = save
+    setCanSaveSnapshot(!!save)
   }, [])
 
   // 添加迁移任务（供子组件调用）
@@ -762,6 +771,7 @@ function App() {
             onAddMigrateTask={addMigrateTask}
             onFileDeleted={setOnFileDeleted}
             tasks={tasks}
+            onSaveSnapshotReady={handleSaveSnapshotReady}
           />
         </main>
       </div>
@@ -788,6 +798,8 @@ function App() {
         open={showSnapshots} 
         onClose={() => setShowSnapshots(false)}
         onLoadSnapshot={(snapshot) => setLoadedSnapshot(snapshot)}
+        onSaveCurrent={() => saveSnapshotRef.current?.()}
+        canSaveCurrent={canSaveSnapshot}
       />
 
       {/* 任务队列对话框 */}

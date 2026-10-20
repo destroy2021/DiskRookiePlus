@@ -33,6 +33,8 @@ pub fn run() {
             commands::storage::delete_storage_file,
             commands::storage::list_storage_files,
             commands::storage::get_storage_path,
+            commands::storage::write_storage_file_gzip,
+            commands::storage::read_storage_file_gzip,
             // OAuth commands
             commands::oauth::complete_google_oauth,
             commands::oauth::refresh_google_token,

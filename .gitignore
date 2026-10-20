@@ -24,3 +24,7 @@ Thumbs.db
 # IDE（可选，若需共享可删除）
 # .vscode/
 # .idea/
+
+# AI 工具产物（codegraph 索引 / DSH 会话数据，勿提交）
+.codegraph/
+.dsh/
