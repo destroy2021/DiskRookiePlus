@@ -15,4 +15,6 @@ pub use scanner::{scan_path, scan_path_with_progress, scan_will_use_mft};
 
 pub use ai_disk_domain::TopFileEntry;
 #[cfg(windows)]
-pub use mft_scan::{get_volume_space_bytes, scan_volume_mft_top_files, TOP_FILES_DEFAULT_N};
+pub use mft_scan::{
+    get_volume_space_bytes, scan_volume_mft_records, scan_volume_mft_top_files, TOP_FILES_DEFAULT_N,
+};

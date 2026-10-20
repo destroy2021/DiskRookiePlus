@@ -6,6 +6,7 @@ members = [
     "crates/disk-scanner",
     "crates/ai-engine",
     "crates/executor",
+    "crates/mcp-server",
     "apps/desktop/src-tauri",
 ]
 

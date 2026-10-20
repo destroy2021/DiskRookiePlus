@@ -152,11 +152,7 @@ fn disk_usage_comparison() {
 
     // 3. 对比
     eprintln!("---------- 对比分析 ----------");
-    let diff = if system_used >= scan_total_size {
-        system_used - scan_total_size
-    } else {
-        scan_total_size - system_used
-    };
+    let diff = system_used.abs_diff(scan_total_size);
     let diff_pct = if system_used > 0 {
         (diff as f64 / system_used as f64) * 100.0
     } else {

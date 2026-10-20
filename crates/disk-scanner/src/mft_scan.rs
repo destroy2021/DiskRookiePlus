@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use ai_disk_common::DiskAnalyzerError;
-use ai_disk_domain::{FileNode, ScanResult, TopFileEntry};
+use ai_disk_domain::{FileNode, MftRecordEntry, ScanResult, TopFileEntry};
 use ntfs_reader::errors::NtfsReaderError;
 use ntfs_reader::file_info::{FileInfo, HashMapCache};
 use ntfs_reader::mft::Mft;
@@ -179,17 +179,12 @@ pub fn is_windows_volume_root(path: &Path) -> bool {
     false
 }
 
-/// 「前 N 大文件」功能的默认 N（如 100）。
-pub const TOP_FILES_DEFAULT_N: usize = 100;
-
-/// 仅获取卷上按文件大小最大的前 N 个**文件**（不含目录）。
-/// 优化：枚举时用最小堆维护前 N，**不构建整棵树**，省去阶段 3，内存仅 O(N)。
-/// 若只需“最大的 100 个文件”场景，比完整 `scan_volume_mft` 快且省内存。
-pub fn scan_volume_mft_top_files(
+/// 校验路径为 Windows 卷根并打开其 MFT（Volume::new + Mft::new）。
+/// 返回 `(Mft, 盘符大写, canonicalize 后的卷根路径)`；权限不足等错误透传给调用方。
+/// 供 top_files / 全量扫描 / 记录枚举三个入口共用。
+fn open_mft_for_volume_root(
     path: &str,
-    n: usize,
-    progress: Option<&ProgressCb>,
-) -> Result<Vec<TopFileEntry>, DiskAnalyzerError> {
+) -> Result<(Mft, String, std::path::PathBuf), DiskAnalyzerError> {
     let path_buf = normalize_path(path);
     if !path_buf.exists() {
         return Err(DiskAnalyzerError::InvalidPath(format!(
@@ -204,15 +199,28 @@ pub fn scan_volume_mft_top_files(
             "not a volume root".to_string(),
         ));
     }
-
     let drive = drive_letter_from_volume_root(&path_buf).ok_or_else(|| {
         DiskAnalyzerError::InvalidPath("cannot get drive letter from volume root".to_string())
     })?;
-
+    // 使用上游 ntfs-reader API：Mft::new 一次性加载 $MFT，再 iterate_files 枚举。
     let volume_path = format!(r"\\.\{}:", drive);
     let volume = Volume::new(volume_path.as_str()).map_err(to_disk_analyzer_error)?;
     let mft = Mft::new(volume).map_err(to_disk_analyzer_error)?;
+    Ok((mft, drive, path_buf))
+}
 
+/// 「前 N 大文件」功能的默认 N（如 100）。
+pub const TOP_FILES_DEFAULT_N: usize = 100;
+
+/// 仅获取卷上按文件大小最大的前 N 个**文件**（不含目录）。
+/// 优化：枚举时用最小堆维护前 N，**不构建整棵树**，省去阶段 3，内存仅 O(N)。
+/// 若只需“最大的 100 个文件”场景，比完整 `scan_volume_mft` 快且省内存。
+pub fn scan_volume_mft_top_files(
+    path: &str,
+    n: usize,
+    progress: Option<&ProgressCb>,
+) -> Result<Vec<TopFileEntry>, DiskAnalyzerError> {
+    let (mft, drive, _) = open_mft_for_volume_root(path)?;
     let vol_trim_for_filter = format!("{}:", drive);
     let cap = n.saturating_add(1).min(1_000_000);
     let mut heap: BinaryHeap<Reverse<(u64, String, Option<u64>)>> = BinaryHeap::with_capacity(cap);
@@ -264,6 +272,51 @@ pub fn scan_volume_mft_top_files(
         .collect();
     list.sort_by(|a, b| b.size.cmp(&a.size));
     Ok(list)
+}
+
+/// 流式枚举卷上全部 MFT 记录（`MftRecordEntry`：path/is_dir/size/modified），不建树。
+///
+/// 供名称搜索等流式消费（红线 4：回调逐条消费，无结果缓存）。
+/// `callback` 返回 `false` 表示调用方已收集足够结果，此后仅空转跳过处理
+/// （底层 `iterate_files` 无法中断，但不构造条目，开销极小）。
+/// 非管理员权限打开卷失败时返回 `Err`，由调用方回退目录 walk。
+pub fn scan_volume_mft_records<F>(path: &str, mut callback: F) -> Result<(), DiskAnalyzerError>
+where
+    F: FnMut(&MftRecordEntry) -> bool,
+{
+    let (mft, drive, _) = open_mft_for_volume_root(path)?;
+    let vol_trim_for_filter = format!("{}:", drive);
+    let mut cache = HashMapCache::default();
+    let mut done = false;
+    mft.iterate_files(|file| {
+        if done {
+            return;
+        }
+        let info = FileInfo::with_cache(&mft, file, &mut cache);
+        let path_str = info.path.to_string_lossy();
+        let full_path = normalize_ntfs_path(&path_str, &drive);
+        if !path_under_volume_ascii(&full_path, &vol_trim_for_filter) {
+            return;
+        }
+        let modified = info.modified.and_then(|t| {
+            let s = t.unix_timestamp();
+            if s > 0 {
+                Some(s as u64)
+            } else {
+                None
+            }
+        });
+        let entry = MftRecordEntry {
+            path: full_path,
+            is_dir: info.is_directory,
+            size: info.size,
+            modified,
+        };
+        if !callback(&entry) {
+            done = true;
+        }
+    });
+    Ok(())
 }
 
 /// Single MFT-derived record for tree building.
@@ -330,20 +383,7 @@ pub fn scan_volume_mft(
     shallow_dirs: bool,
 ) -> Result<ScanResult, DiskAnalyzerError> {
     let start = Instant::now();
-    let path_buf = normalize_path(path);
-    if !path_buf.exists() {
-        return Err(DiskAnalyzerError::InvalidPath(format!(
-            "path does not exist: {}",
-            path
-        )));
-    }
-    let path_buf = std::fs::canonicalize(&path_buf)
-        .map_err(|e| DiskAnalyzerError::InvalidPath(format!("cannot resolve path: {}", e)))?;
-    if !is_windows_volume_root(&path_buf) {
-        return Err(DiskAnalyzerError::InvalidPath(
-            "not a volume root".to_string(),
-        ));
-    }
+    let (mft, drive, path_buf) = open_mft_for_volume_root(path)?;
 
     let volume_root_str = path_buf
         .to_string_lossy()
@@ -355,10 +395,6 @@ pub fn scan_volume_mft(
         volume_root_str
     };
 
-    let drive = drive_letter_from_volume_root(&path_buf).ok_or_else(|| {
-        DiskAnalyzerError::InvalidPath("cannot get drive letter from volume root".to_string())
-    })?;
-
     stderr_ln!(
         "[scan:mft] starting MFT full scan for volume {} (drive {})",
         path_buf.display(),
@@ -367,13 +403,9 @@ pub fn scan_volume_mft(
     if let Some(ref cb) = progress {
         cb(0, "[scan:mft] opening volume...");
     }
-    let volume_path = format!(r"\\.\{}:", drive);
     let volume_root_trim = format!("{}:", drive);
     let volume_root_key = format!(r"{}:\", drive);
-    // 使用上游 ntfs-reader API：Mft::new 一次性加载 $MFT，再 iterate_files 枚举。
-    let volume = Volume::new(volume_path.as_str()).map_err(to_disk_analyzer_error)?;
-    stderr_ln!("[scan:mft] volume opened: {} bytes", volume.volume_size);
-    let mft = Mft::new(volume).map_err(to_disk_analyzer_error)?;
+    stderr_ln!("[scan:mft] volume opened: {} bytes", mft.volume.volume_size);
     stderr_ln!(
         "[scan:mft] MFT loaded into memory, max_records={}",
         mft.max_record
@@ -437,7 +469,8 @@ pub fn scan_volume_mft(
     if n_filtered > 0 || size_filtered > 0 {
         stderr_ln!(
             "[scan:mft] path 过滤: {} 条记录、{} 字节(文件)被排除",
-            n_filtered, size_filtered
+            n_filtered,
+            size_filtered
         );
     }
     if let Some(ref cb) = progress {
