@@ -15,12 +15,20 @@ apps/desktop/src-tauri/gen/
 # 系统
 .DS_Store
 Thumbs.db
+Desktop.ini
 
 # 日志与临时
 *.log
+*.tmp
+*.temp
+*.tsbuildinfo
+.eslintcache
+.vite/
+coverage/
 .env
-.env.local
+.env.*
+!.env.example
 
-# IDE（可选，若需共享可删除）
+# IDE
 # .vscode/
-# .idea/
+.idea/

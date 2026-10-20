@@ -8,6 +8,7 @@ use crate::TopFileEntry;
 pub struct ScanResult {
     pub root: FileNode,
     pub scan_time_ms: u64,
+    /// 扫描到的文件数量（不含目录，不受返回给前端的树裁剪影响）
     pub file_count: u64,
     /// 本次扫描到的文件总大小（非卷容量）
     pub total_size: u64,

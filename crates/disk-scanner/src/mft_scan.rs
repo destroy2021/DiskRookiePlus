@@ -369,7 +369,8 @@ pub fn scan_volume_mft(
     }
     let volume_path = format!(r"\\.\{}:", drive);
     let volume_root_trim = format!("{}:", drive);
-    let volume_root_key = format!(r"{}:\", drive);
+    // 顶层节点的父路径由 `rfind('\\')` 截取得到 `D:`，索引必须使用同一形式。
+    let volume_root_key = volume_root_trim.clone();
     // 使用上游 ntfs-reader API：Mft::new 一次性加载 $MFT，再 iterate_files 枚举。
     let volume = Volume::new(volume_path.as_str()).map_err(to_disk_analyzer_error)?;
     stderr_ln!("[scan:mft] volume opened: {} bytes", volume.volume_size);
@@ -437,7 +438,8 @@ pub fn scan_volume_mft(
     if n_filtered > 0 || size_filtered > 0 {
         stderr_ln!(
             "[scan:mft] path 过滤: {} 条记录、{} 字节(文件)被排除",
-            n_filtered, size_filtered
+            n_filtered,
+            size_filtered
         );
     }
     if let Some(ref cb) = progress {
@@ -454,6 +456,7 @@ pub fn scan_volume_mft(
 
     // 所有文件（非目录）的 size 之和；path 过滤的不计入（避免重复/膨胀）
     let sum_all_file_sizes: u64 = records.iter().filter(|r| !r.is_dir).map(|r| r.size).sum();
+    let actual_file_count = records.iter().filter(|r| !r.is_dir).count() as u64;
     let t_after_mft_read = Instant::now();
     let t_after_iterate = t_after_mft_read;
 
@@ -465,7 +468,7 @@ pub fn scan_volume_mft(
         .unwrap_or_else(|| path.to_string());
     let root_path_str = path_buf.display().to_string();
 
-    let (root, file_count, _tree_total) = build_tree_from_mft_records(
+    let (root, _tree_node_count, _tree_total) = build_tree_from_mft_records(
         &records,
         &child_index,
         &recursive_sizes,
@@ -483,7 +486,7 @@ pub fn scan_volume_mft(
     let total_size = sum_all_file_sizes;
     stderr_ln!(
         "[scan:mft] build_tree done: file_count={}, total_size={}, elapsed_ms={}",
-        file_count,
+        actual_file_count,
         total_size,
         scan_time_ms
     );
@@ -534,7 +537,7 @@ pub fn scan_volume_mft(
     Ok(ScanResult {
         root: root_pruned,
         scan_time_ms,
-        file_count,
+        file_count: actual_file_count,
         total_size,
         scan_warning: None,
         volume_total_bytes,
@@ -598,7 +601,16 @@ fn build_tree_from_mft_records(
                     .iter()
                     .any(|&s| s.eq_ignore_ascii_case(name));
             let path = rec.full_path.as_str();
-            if is_shallow {
+            if !rec.is_dir {
+                FileNode {
+                    path: path.to_string(),
+                    name: name.to_string(),
+                    size: rec.size,
+                    is_dir: false,
+                    modified: rec.modified,
+                    children: vec![],
+                }
+            } else if is_shallow {
                 let size = recursive_sizes
                     .get(path.trim_end_matches('\\'))
                     .copied()
@@ -750,7 +762,18 @@ fn build_subtree_from_indices(
             && SHALLOW_DIR_NAMES
                 .iter()
                 .any(|&s| s.eq_ignore_ascii_case(child_name));
-        if is_shallow {
+        if !rec.is_dir {
+            size += rec.size;
+            file_count += 1;
+            children.push(FileNode {
+                path: child_path.to_string(),
+                name: child_name.to_string(),
+                size: rec.size,
+                is_dir: false,
+                modified: rec.modified,
+                children: vec![],
+            });
+        } else if is_shallow {
             let child_size = recursive_sizes
                 .get(child_path.trim_end_matches('\\'))
                 .copied()
@@ -783,13 +806,17 @@ fn build_subtree_from_indices(
             file_count += cnt;
             children.push(child_node);
         } else {
-            size += rec.size;
+            let child_size = recursive_sizes
+                .get(child_path.trim_end_matches('\\'))
+                .copied()
+                .unwrap_or(rec.size);
+            size += child_size;
             file_count += 1;
             children.push(FileNode {
                 path: child_path.to_string(),
                 name: child_name.to_string(),
-                size: rec.size,
-                is_dir: rec.is_dir,
+                size: child_size,
+                is_dir: true,
                 modified: rec.modified,
                 children: vec![],
             });
@@ -831,4 +858,81 @@ fn build_subtree_from_indices(
         children,
     };
     (node, file_count + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(path: &str, size: u64, is_dir: bool) -> MftRecord {
+        MftRecord {
+            full_path: path.to_string(),
+            size,
+            is_dir,
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn mft_tree_keeps_direct_file_sizes_and_types() {
+        let records = vec![
+            record(r"D:\Gallery", 0, true),
+            record(r"D:\Gallery\photo.bin", 100, false),
+            record(r"D:\游戏", 0, true),
+            record(r"D:\游戏\game.bin", 200, false),
+            record(r"D:\output.log", 50, false),
+        ];
+        let child_index = HashMap::from([
+            ("D:".to_string(), vec![0, 2, 4]),
+            (r"D:\Gallery".to_string(), vec![1]),
+            (r"D:\游戏".to_string(), vec![3]),
+        ]);
+        let direct_sizes = records
+            .iter()
+            .map(|record| (record.full_path.clone(), record.size))
+            .collect();
+        let recursive_sizes =
+            compute_recursive_sizes(&records, &child_index, &direct_sizes, "D:", "D:");
+
+        let (root, _, total_size) = build_tree_from_mft_records(
+            &records,
+            &child_index,
+            &recursive_sizes,
+            "D:",
+            "D:",
+            r"D:\",
+            r"D:\",
+            false,
+            None,
+            records.len() as u64,
+        )
+        .expect("build MFT tree");
+
+        assert_eq!(total_size, 350);
+        assert_eq!(root.size, 350);
+        assert_eq!(root.children.len(), 3);
+
+        let gallery = root
+            .children
+            .iter()
+            .find(|node| node.name == "Gallery")
+            .expect("Gallery node");
+        assert_eq!(gallery.size, 100);
+        assert!(!gallery.children[0].is_dir);
+
+        let games = root
+            .children
+            .iter()
+            .find(|node| node.name == "游戏")
+            .expect("游戏 node");
+        assert_eq!(games.size, 200);
+
+        let root_file = root
+            .children
+            .iter()
+            .find(|node| node.name == "output.log")
+            .expect("root file");
+        assert_eq!(root_file.size, 50);
+        assert!(!root_file.is_dir);
+    }
 }
