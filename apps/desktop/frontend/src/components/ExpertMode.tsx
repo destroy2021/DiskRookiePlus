@@ -351,7 +351,7 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
     const [progressFiles, setProgressFiles] = useState(0)
     const [, setProgressMessage] = useState('')
     const [viewMode, setViewMode] = useState<'disk' | 'ai-prompt'>('disk')
-    const [shallowDirs, setShallowDirs] = useState(true)
+    const [shallowDirs, setShallowDirs] = useState(false)
     const openedSettingsForStandardRef = useRef(false)
 
     // 快照用的上下文：实际扫描参数、发给 AI 的 prompt 全文、模型名、分析完成时间
@@ -1006,7 +1006,10 @@ export function ExpertMode({ onOpenSettings, loadedSnapshot, onSnapshotLoaded, s
                 {/* 搜索下方：左侧 group(checkbox + 标准/开发者) | 右侧 三个统计 */}
                 <div className="flex items-center justify-between gap-4 flex-wrap">
                     <div className="flex items-center gap-3 px-3 py-2 rounded-xl border border-slate-200/80 dark:border-gray-600 bg-slate-50/50 dark:bg-gray-700/30">
-                        <label className="flex items-center gap-2 cursor-pointer group w-fit select-none">
+                        <label
+                            className="flex items-center gap-2 cursor-pointer group w-fit select-none"
+                            title={t('expertMode.shallowDirsHint')}
+                        >
                             <div className={`w-4 h-4 rounded border transition-all flex items-center justify-center ${shallowDirs ? 'bg-primary border-primary' : 'border-slate-300 dark:border-gray-500'}`}>
                                 {shallowDirs && <CheckCircle2 size={10} className="text-secondary" />}
                             </div>

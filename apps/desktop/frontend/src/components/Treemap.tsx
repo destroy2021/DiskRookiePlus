@@ -16,123 +16,53 @@ interface Block {
   w: number
   h: number
   node: TreemapNode
-  depth: number
 }
 
-const MIN_BLOCK_SIZE = 16
-const MAX_DEPTH = 6
-
-/** 单层 squarified 布局：将矩形 (x,y,w,h) 按 nodes 的 size 比例划分 */
-function squarifyRow(
+/** 平衡二分布局：沿当前长边切分，避免小目录全部挤成横向细条。 */
+function layoutBalanced(
   nodes: TreemapNode[],
   x: number,
   y: number,
   w: number,
-  h: number,
-  horizontal: boolean
-): { node: TreemapNode; x: number; y: number; w: number; h: number }[] {
-  const total = nodes.reduce((s, n) => s + n.size, 0)
-  if (total <= 0 || nodes.length === 0) return []
-
+  h: number
+): Block[] {
   const sorted = [...nodes].filter((n) => n.size > 0).sort((a, b) => b.size - a.size)
-  const result: { node: TreemapNode; x: number; y: number; w: number; h: number }[] = []
-  let px = x,
-    py = y,
-    pw = w,
-    ph = h
-  let remainingTotal = total
+  const result: Block[] = []
 
-  for (let i = 0; i < sorted.length; ) {
-    const main = horizontal ? pw : ph
-    const sub = horizontal ? ph : pw
-    let row: TreemapNode[] = [sorted[i]]
-    let rowSum = sorted[i].size
-    i++
-
-    while (i < sorted.length) {
-      const next = sorted[i]
-      const newSum = rowSum + next.size
-      const newRow = [...row, next]
-      const r1 = main * (rowSum / remainingTotal)
-      const r2 = main * (newSum / remainingTotal)
-      const worst1 = Math.max(sub / r1, r1 / sub)
-      const worst2 = Math.max(sub / r2, r2 / sub)
-      if (worst1 <= worst2) {
-        row = newRow
-        rowSum = newSum
-        i++
-      } else break
+  function split(items: TreemapNode[], sx: number, sy: number, sw: number, sh: number) {
+    if (items.length === 0) return
+    if (items.length === 1) {
+      result.push({ node: items[0], x: sx, y: sy, w: sw, h: sh })
+      return
     }
 
-    const rowRatio = rowSum / remainingTotal
-    let rw: number, rh: number, rx: number, ry: number
-    if (horizontal) {
-      rw = pw * rowRatio
-      rh = ph
-      rx = px
-      ry = py
-      px += rw
-      pw -= rw
+    const total = items.reduce((sum, node) => sum + node.size, 0)
+    const target = total / 2
+    let splitAt = 1
+    let firstTotal = items[0].size
+    while (splitAt < items.length - 1) {
+      const withNext = firstTotal + items[splitAt].size
+      if (Math.abs(target - withNext) > Math.abs(target - firstTotal)) break
+      firstTotal = withNext
+      splitAt++
+    }
+
+    const ratio = firstTotal / total
+    const first = items.slice(0, splitAt)
+    const second = items.slice(splitAt)
+    if (sw >= sh) {
+      const firstWidth = sw * ratio
+      split(first, sx, sy, firstWidth, sh)
+      split(second, sx + firstWidth, sy, sw - firstWidth, sh)
     } else {
-      rw = pw
-      rh = ph * rowRatio
-      rx = px
-      ry = py
-      py += rh
-      ph -= rh
+      const firstHeight = sh * ratio
+      split(first, sx, sy, sw, firstHeight)
+      split(second, sx, sy + firstHeight, sw, sh - firstHeight)
     }
-
-    let ix = rx,
-      iy = ry
-    row.forEach((node) => {
-      const frac = node.size / rowSum
-      const iw = horizontal ? rw * frac : rw
-      const ih = horizontal ? rh : rh * frac
-      result.push({ node, x: ix, y: iy, w: iw, h: ih })
-      if (horizontal) ix += iw
-      else iy += ih
-    })
-
-    remainingTotal -= rowSum
   }
 
+  split(sorted, x, y, w, h)
   return result
-}
-
-/** 递归堆叠布局：生成所有层级的方块（父先子后，子绘制在上层） */
-function layoutRecursive(
-  root: TreemapNode,
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  depth: number,
-  output: Block[]
-) {
-  const children = (root.children ?? []).filter((c) => c.size > 0)
-  const horizontal = w >= h
-
-  if (children.length === 0 || depth >= MAX_DEPTH || w < MIN_BLOCK_SIZE || h < MIN_BLOCK_SIZE) {
-    output.push({ x, y, w, h, node: root, depth })
-    return
-  }
-
-  const rows = squarifyRow(children, x, y, w, h, horizontal)
-
-  for (const { node, x: cx, y: cy, w: cw, h: ch } of rows) {
-    const subChildren = (node.children ?? []).filter((c) => c.size > 0)
-    const canRecurse =
-      subChildren.length > 0 &&
-      cw >= MIN_BLOCK_SIZE &&
-      ch >= MIN_BLOCK_SIZE &&
-      depth + 1 < MAX_DEPTH
-
-    if (canRecurse) {
-      layoutRecursive(node, cx, cy, cw, ch, depth + 1, output)
-    } else {
-      output.push({ x: cx, y: cy, w: cw, h: ch, node, depth: depth + 1 })
-    }
-  }
 }
 
 interface TreemapProps {
@@ -144,7 +74,20 @@ interface TreemapProps {
 
 export function Treemap({ root, width, height, onHover }: TreemapProps) {
   const containerRef = useRef<HTMLDivElement>(null)
+  const [navigationState, setNavigationState] = useState<{ root: TreemapNode; nodes: TreemapNode[]; zoom: number }>({
+    root,
+    nodes: [root],
+    zoom: 1,
+  })
   const [dimensions, setDimensions] = useState({ width, height })
+  const navigation = useMemo(
+    () => (navigationState.root === root ? navigationState.nodes : [root]),
+    [navigationState, root]
+  )
+  const zoom = navigationState.root === root ? navigationState.zoom : 1
+  const currentRoot = navigation[navigation.length - 1] ?? root
+  const canvasWidth = dimensions.width * zoom
+  const canvasHeight = dimensions.height * zoom
 
   useEffect(() => {
     const el = containerRef.current
@@ -155,63 +98,146 @@ export function Treemap({ root, width, height, onHover }: TreemapProps) {
     })
     ro.observe(el)
     return () => ro.disconnect()
-  }, [])
+  }, [height, width])
 
-  const blocks = useMemo(() => {
-    const out: Block[] = []
-    layoutRecursive(root, 2, 2, dimensions.width - 4, dimensions.height - 4, 0, out)
-    return out
-  }, [root, dimensions])
+  const blocks = useMemo<Block[]>(() => {
+    const children = (currentRoot.children ?? []).filter((child) => child.size > 0)
+    return layoutBalanced(
+      children,
+      2,
+      2,
+      Math.max(1, canvasWidth - 4),
+      Math.max(1, canvasHeight - 4)
+    )
+  }, [currentRoot, canvasWidth, canvasHeight])
 
-  // 统一使用 primary 颜色色系（#FFD200 黄色系），不同深度使用不同透明度
-  const colorsByDepth = [
-    'rgba(255, 210, 0, 0.75)',  // 最浅，第一层
-    'rgba(255, 210, 0, 0.65)',  // 第二层
-    'rgba(255, 210, 0, 0.55)',  // 第三层
-    'rgba(255, 210, 0, 0.45)',  // 第四层
-    'rgba(255, 210, 0, 0.35)',  // 第五层
-    'rgba(255, 210, 0, 0.25)',  // 最深，第六层
+  const blockColors = [
+    '#9ec5e6',
+    '#9bcfc5',
+    '#b8afe0',
+    '#a8c7d8',
+    '#a6b8d9',
+    '#afd5cc',
+    '#b6c2ce',
+    '#b5cbed',
   ]
 
+  const openNode = (node: TreemapNode) => {
+    if ((node.children?.length ?? 0) > 0) {
+      setNavigationState({ root, nodes: [...navigation, node], zoom: 1 })
+      onHover?.(null)
+    }
+  }
+
+  useEffect(() => {
+    const viewport = containerRef.current
+    if (!viewport) return
+
+    const handleWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey || event.deltaY === 0) return
+      event.preventDefault()
+
+      const nextZoom = Math.min(8, Math.max(1, zoom * (event.deltaY < 0 ? 1.2 : 1 / 1.2)))
+      if (nextZoom === zoom) return
+
+      const rect = viewport.getBoundingClientRect()
+      const pointerX = event.clientX - rect.left
+      const pointerY = event.clientY - rect.top
+      const contentX = (viewport.scrollLeft + pointerX) / zoom
+      const contentY = (viewport.scrollTop + pointerY) / zoom
+
+      setNavigationState({ root, nodes: navigation, zoom: nextZoom })
+      requestAnimationFrame(() => {
+        viewport.scrollLeft = contentX * nextZoom - pointerX
+        viewport.scrollTop = contentY * nextZoom - pointerY
+      })
+    }
+
+    viewport.addEventListener('wheel', handleWheel, { passive: false })
+    return () => viewport.removeEventListener('wheel', handleWheel)
+  }, [navigation, root, zoom])
+
   return (
-    <div ref={containerRef} className="w-full h-full min-h-[350px]">
-      <svg width={dimensions.width} height={dimensions.height} className="block">
-        {blocks.map((block, i) => {
-          const color = colorsByDepth[block.depth % colorsByDepth.length]
-          const showLabel = block.w > 40 && block.h > 22
-          return (
-            <g key={`${block.node.path}-${i}`}>
-              <rect
-                x={block.x}
-                y={block.y}
-                width={block.w}
-                height={block.h}
-                fill={color}
-                stroke="rgba(0,0,0,0.12)"
-                strokeWidth={1}
-                onMouseEnter={() => onHover?.(block.node)}
-                onMouseLeave={() => onHover?.(null)}
-                className="cursor-pointer transition-opacity hover:opacity-90"
-              />
-              {showLabel && (
-                <text
-                  x={block.x + block.w / 2}
-                  y={block.y + block.h / 2}
-                  textAnchor="middle"
-                  dominantBaseline="middle"
-                  fill="#1a1a1a"
-                  className="pointer-events-none select-none font-medium"
-                  style={{ fontSize: Math.min(10, block.w / 5, block.h / 2.5) }}
-                >
-                  {block.node.name.length > 12
-                    ? block.node.name.slice(0, 10) + '…'
-                    : block.node.name}
-                </text>
-              )}
-            </g>
-          )
-        })}
-      </svg>
+    <div className="w-full h-full min-h-[350px] flex flex-col">
+      <div className="h-8 shrink-0 flex items-center gap-2 px-1 text-xs">
+        <nav className="min-w-0 flex-1 flex items-center gap-1 overflow-x-auto" aria-label="目录层级">
+          {navigation.map((node, index) => (
+            <span key={`${node.path}-${index}`} className="flex items-center gap-1 shrink-0">
+              {index > 0 && <span className="text-slate-400">/</span>}
+              <button
+                type="button"
+                className="max-w-48 truncate rounded px-1.5 py-0.5 text-slate-600 hover:bg-slate-100 hover:text-slate-900 dark:text-gray-300 dark:hover:bg-gray-700"
+                onClick={() => {
+                  setNavigationState({ root, nodes: navigation.slice(0, index + 1), zoom: 1 })
+                  onHover?.(null)
+                }}
+                title={node.path}
+              >
+                {node.name}
+              </button>
+            </span>
+          ))}
+        </nav>
+        <span className="shrink-0 text-slate-400" title="按住 Ctrl 并滚动鼠标滚轮缩放">
+          Ctrl + 滚轮 · {Math.round(zoom * 100)}%
+        </span>
+      </div>
+      <div
+        ref={containerRef}
+        className="min-h-0 flex-1 overflow-auto overscroll-contain"
+      >
+        <svg width={canvasWidth} height={canvasHeight} className="block">
+          {blocks.map((block, i) => {
+            const color = blockColors[(i + navigation.length - 1) % blockColors.length]
+            const showLabel = block.w > 40 && block.h > 22
+            const canOpen = (block.node.children?.length ?? 0) > 0
+            return (
+              <g
+                key={`${block.node.path}-${i}`}
+                role={canOpen ? 'button' : undefined}
+                tabIndex={canOpen ? 0 : undefined}
+                aria-label={canOpen ? `打开 ${block.node.name}` : block.node.name}
+                onClick={() => openNode(block.node)}
+                onKeyDown={(event) => {
+                  if (canOpen && (event.key === 'Enter' || event.key === ' ')) {
+                    event.preventDefault()
+                    openNode(block.node)
+                  }
+                }}
+              >
+                <title>{`${block.node.path} · ${block.node.size.toLocaleString()} bytes`}</title>
+                <rect
+                  x={block.x}
+                  y={block.y}
+                  width={block.w}
+                  height={block.h}
+                  fill={color}
+                  stroke="rgba(0,0,0,0.12)"
+                  strokeWidth={1}
+                  onMouseEnter={() => onHover?.(block.node)}
+                  onMouseLeave={() => onHover?.(null)}
+                  className={`${canOpen ? 'cursor-pointer' : 'cursor-default'} transition-opacity hover:opacity-90`}
+                />
+                {showLabel && (
+                  <text
+                    x={block.x + block.w / 2}
+                    y={block.y + block.h / 2}
+                    textAnchor="middle"
+                    dominantBaseline="middle"
+                    fill="#1a1a1a"
+                    className="pointer-events-none select-none font-medium"
+                    style={{ fontSize: Math.min(10, block.w / 5, block.h / 2.5) }}
+                  >
+                    {block.node.name.length > 12
+                      ? block.node.name.slice(0, 10) + '…'
+                      : block.node.name}
+                  </text>
+                )}
+              </g>
+            )
+          })}
+        </svg>
+      </div>
     </div>
   )
 }

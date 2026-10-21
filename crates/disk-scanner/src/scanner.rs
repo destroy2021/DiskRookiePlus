@@ -51,30 +51,33 @@ fn dir_size_only(
     path: &Path,
     counter: &AtomicU64,
     progress: Option<&ProgressCb>,
-) -> Result<u64, DiskAnalyzerError> {
+) -> Result<(u64, u64), DiskAnalyzerError> {
     let mut total: u64 = 0;
+    let mut file_count: u64 = 0;
     let entries = match std::fs::read_dir(path) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Ok(0);
+            return Ok((0, 0));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // 路径不存在（符号链接失效、文件被删除等），跳过
-            return Ok(0);
+            return Ok((0, 0));
         }
         Err(e) if is_corruption_io_error(&e) => {
-            return Ok(0); // 损坏，跳过该目录
+            return Ok((0, 0)); // 损坏，跳过该目录
         }
         Err(e) => return Err(DiskAnalyzerError::Io(e)),
     };
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_dir() {
-            if let Ok(size) = dir_size_only(&path, counter, progress) {
+            if let Ok((size, count)) = dir_size_only(&path, counter, progress) {
                 total = total.saturating_add(size);
+                file_count = file_count.saturating_add(count);
             }
         } else {
             total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+            file_count = file_count.saturating_add(1);
         }
     }
     counter.fetch_add(1, Ordering::Relaxed);
@@ -84,7 +87,7 @@ fn dir_size_only(
             path.display().to_string().as_str(),
         );
     }
-    Ok(total)
+    Ok((total, file_count))
 }
 
 fn build_tree(
@@ -198,7 +201,7 @@ fn build_tree(
                     .map(|d| d.as_secs());
                 if is_shallow_dir {
                     match dir_size_only(&child_path, counter, progress) {
-                        Ok(size) => Ok((
+                        Ok((size, file_count)) => Ok((
                             FileNode {
                                 path: child_path.display().to_string(),
                                 name: child_name.clone(),
@@ -207,7 +210,7 @@ fn build_tree(
                                 modified: entry_modified,
                                 children: vec![],
                             },
-                            1u64,
+                            file_count,
                         )),
                         Err(DiskAnalyzerError::PermissionDenied(_)) => Ok((
                             FileNode {
@@ -487,10 +490,19 @@ mod tests {
     fn test_scan_temp_dir() {
         let (_guard, path) = create_test_dir();
         let result = scan_path(&path).unwrap();
-        assert!(result.file_count >= 2);
+        assert_eq!(result.file_count, 2);
         assert!(result.total_size >= 10);
 
         assert!(!result.root.children.is_empty());
+    }
+
+    #[test]
+    fn test_size_only_scan_keeps_real_file_count() {
+        let (guard, _) = create_test_dir();
+        let counter = AtomicU64::new(0);
+        let (size, file_count) = dir_size_only(guard.path(), &counter, None).unwrap();
+        assert_eq!(size, 10);
+        assert_eq!(file_count, 2);
     }
 
     #[test]
